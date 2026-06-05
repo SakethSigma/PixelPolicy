@@ -1,0 +1,12 @@
+[project]
+name = "training"
+version = "0.1.0"
+description = "Training pipelines for game-playing agents"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "datasets>=2.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]

@@ -1,0 +1,17 @@
+[project]
+name = "pixel-policy"
+version = "0.1.0"
+description = "From pixels to policies — multimodal agents that learn to play games"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["games/*", "agents", "training", "inference"]
+
+[tool.uv.sources]
+agents = { workspace = true }
+training = { workspace = true }
+inference = { workspace = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

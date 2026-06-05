@@ -1,0 +1,10 @@
+[project]
+name = "game-snake"
+version = "0.1.0"
+description = "Snake — a FastAPI game server"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.0.0",
+]
