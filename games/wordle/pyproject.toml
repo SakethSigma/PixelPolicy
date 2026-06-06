@@ -19,3 +19,9 @@ dev = [
     "pytest>=8.0.0",
     "rich>=13.0.0",  # play.py / test_play.py
 ]
+
+[tool.uv]
+# Flat-layout namespace modules imported via the workspace `pythonpath`, not built as a
+# wheel. Tell uv to resolve deps but not invoke a build backend (setuptools can't
+# auto-discover this layout). Imports resolve from the repo root.
+package = false

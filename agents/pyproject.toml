@@ -4,7 +4,25 @@ version = "0.1.0"
 description = "Lightweight model wrappers for game-playing agents"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.40.0",
+    "openai>=1.0.0",       # OpenAI-compatible backend (vLLM or OpenAI via base_url)
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
+    "game-wordle",          # reuse render_observation / WordleClient / render_board
 ]
+
+[project.optional-dependencies]
+# Terminal demo only — eval/training installs don't need it: pip install agents[tui]
+tui = ["rich>=13.0.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+game-wordle = { workspace = true }
+
+[tool.uv]
+# Flat-layout namespace package imported via the workspace `pythonpath`, not built as a
+# wheel — resolve deps without invoking a build backend.
+package = false

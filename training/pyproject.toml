@@ -10,3 +10,8 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
 ]
+
+[tool.uv]
+# Flat-layout namespace package imported via the workspace `pythonpath`, not built as a
+# wheel — resolve deps without invoking a build backend.
+package = false

@@ -12,7 +12,7 @@ The repo is organized around four clear responsibilities:
 
 **`games/`** — Each game is an isolated FastAPI server. Games expose a standard REST interface (reset, step, render, valid actions) so any agent can play any game without game-specific logic leaking into agent or training code. Each game lives in its own subdirectory with its own `pyproject.toml`, keeping dependencies isolated.
 
-**`agents/`** — Agents are thin wrappers over models (e.g. Claude, GPT-4o). They receive a game observation and return an action. Keeping agents lightweight means the interesting logic lives in training, not in agent scaffolding.
+**`agents/`** — Agents are thin wrappers over models reached through an OpenAI-compatible API (a local model via vLLM, or a hosted OpenAI/Claude endpoint). They receive a game observation and return an action. Keeping agents lightweight means the interesting logic lives in training, not in agent scaffolding.
 
 **`training/`** — Training pipelines (e.g. RL, GRPO, supervised fine-tuning) that drive an agent through a game environment and update model weights or prompts.
 
@@ -33,21 +33,21 @@ PixelPolicy/
 ├── .env                    # your keys (gitignored)
 ├── .env.example
 ├── games/
-│   ├── snake/
-│   │   ├── pyproject.toml  # fastapi, uvicorn
-│   │   └── server.py
-│   └── <game>/             # add new games here
-│       ├── pyproject.toml
-│       └── server.py
+│   ├── wordle/             # the reference game
+│   │   ├── pyproject.toml  # fastapi, uvicorn, (rich for the [tui])
+│   │   ├── game.py         # pure core    server.py  client.py  render.py  play.py
+│   │   └── ...
+│   └── <game>/             # add new games here (same layout)
 ├── agents/
-│   ├── pyproject.toml      # anthropic, openai, pydantic
-│   └── ...
+│   ├── pyproject.toml      # openai, pydantic, python-dotenv, game-wordle ([tui]=rich)
+│   ├── base.py backend.py rollout.py run.py config.py
+│   └── wordle/agent.py     # the only Wordle-aware agent code
 ├── training/
 │   ├── pyproject.toml      # torch, transformers, datasets
 │   └── ...
 └── inference/
-    ├── pyproject.toml      # httpx, pydantic
-    └── ...
+    ├── pyproject.toml      # vllm
+    └── server.py           # thin launcher over `vllm serve`
 ```
 
 ---
@@ -81,16 +81,32 @@ cp .env.example .env
 # edit .env and fill in your keys
 ```
 
-### Run a Game Server (example)
+### Watch an agent play Wordle
+
+Two steps: host a model, then run the agent. (The agent steps the game in-process — no game
+server needed for this.)
 
 ```bash
-uv run --package game-snake uvicorn games.snake.server:app --reload
+# 1. host a model locally (vLLM, OpenAI-compatible). First start compiles graphs (~minutes);
+#    wait for "Application startup complete". See inference/README.md.
+uv run --package inference python -m inference.server
+
+# 2. in another shell, watch one game on a colored board
+uv run --package agents python -m agents.run --demo --word crane
+#    or a headless win-rate over many games:
+uv run --package agents python -m agents.run --episodes 20
 ```
 
-### Run an Agent
+A Wordle-fine-tuned model plays far better than the base model — host it with
+`--model saketh-chervu/qwen3-06b-wordle-sft-phase1-best`. See **[agents/Readme.md](agents/Readme.md)**,
+**[agents/wordle/README.md](agents/wordle/README.md)** (exact prompts/parsing per round), and
+**[inference/README.md](inference/README.md)**.
+
+### Play Wordle yourself / run the game's HTTP server
 
 ```bash
-uv run --package agents python -m agents.run --game http://localhost:8000
+uv run --package game-wordle python -m games.wordle.play        # play in the terminal
+uv run --package game-wordle uvicorn games.wordle.server:app    # the game's REST API
 ```
 
 ---
