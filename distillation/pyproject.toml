@@ -1,0 +1,23 @@
+[project]
+name = "distillation"
+version = "0.1.0"
+description = "Teacher-trajectory distillation: Claude plays games, export SFT data, push to the Hub"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",        # the Claude teacher backend (AnthropicBackend lives in agents/)
+    "datasets>=2.0.0",          # build + push the combined SFT dataset
+    "huggingface-hub>=0.20.0",  # auth + push_to_hub (reads HF_TOKEN)
+    "python-dotenv>=1.0.0",     # load .env (ANTHROPIC_API_KEY, TEACHER_MODEL, HF_HUB_REPO_ID)
+    "pydantic>=2.0.0",          # Trajectory/Turn round-trip
+    "agents",                   # run_eval, Trajectory, AnthropicBackend, the per-game agents
+    "game-wordle",              # WordBank / LocalWordleClient for the Wordle rollouts
+]
+
+[tool.uv.sources]
+agents = { workspace = true }
+game-wordle = { workspace = true }
+
+[tool.uv]
+# Flat-layout namespace package imported via the workspace `pythonpath`, not built as a
+# wheel — resolve deps without invoking a build backend. (Mirrors agents/pyproject.toml.)
+package = false

@@ -13,6 +13,9 @@ dependencies = [
 [project.optional-dependencies]
 # Terminal demo only — eval/training installs don't need it: pip install agents[tui]
 tui = ["rich>=13.0.0"]
+# Teacher backend (AnthropicBackend) for data distillation — only the distillation
+# pipeline needs it; normal OpenAI-compat agent runs don't: pip install agents[teacher]
+teacher = ["anthropic>=0.40.0"]
 
 [dependency-groups]
 dev = [

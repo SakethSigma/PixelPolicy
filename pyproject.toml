@@ -6,12 +6,13 @@ requires-python = ">=3.11"
 dependencies = []
 
 [tool.uv.workspace]
-members = ["games/*", "agents", "training", "inference"]
+members = ["games/*", "agents", "training", "inference", "distillation"]
 
 [tool.uv.sources]
 agents = { workspace = true }
 training = { workspace = true }
 inference = { workspace = true }
+distillation = { workspace = true }
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
