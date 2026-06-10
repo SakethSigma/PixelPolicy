@@ -1,36 +1,81 @@
-"""Stage 3 — combine every game's SFT samples into one dataset and push to the Hub.
+"""Combine per-run SFT JSONL into one HuggingFace dataset and push to the Hub.
 
-Reads all data/sft/*.jsonl, concatenates them (the `game` column keeps provenance),
-optionally dedups and splits, then push_to_hub. huggingface_hub reads HF_TOKEN from the
-env for auth; the repo id comes from cfg.hub_repo_id (HF_HUB_REPO_ID in .env).
+Defaults to the batch_play outputs (batch_low_sft.jsonl + batch_high_sft.jsonl). Each row is
+one exploded move — {game, round, target, system, messages, completion, completion_no_think,
+has_think} — and we add a `source` column (the file stem) for provenance. `huggingface_hub`
+reads HF_TOKEN from the env; the repo id comes from --repo-id or HF_HUB_REPO_ID.
+
+    # inspect without pushing (no token needed)
+    uv run --package distillation python -m distillation.push --dry-run
+
+    # push (needs HF_TOKEN + HF_HUB_REPO_ID in .env)
+    uv run --package distillation python -m distillation.push
 """
 
 from __future__ import annotations
 
-# TODO imports:
-#   import json
-#   from datasets import Dataset, DatasetDict
-#   from distillation.config import DistillConfig
+import argparse
+import json
+import os
+from collections import Counter
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+DEFAULT_INPUTS = [
+    "distillation/data/batch_low_sft.jsonl",
+    "distillation/data/batch_high_sft.jsonl",
+]
 
 
-# TODO: def load_all(cfg) -> list[dict]:
-#   - glob cfg.sft_dir / "*.jsonl"; read every line -> json.loads; return the merged list.
-#   - each record already has {"game", "messages", "completion"}.
+def load_rows(paths: list[str]) -> list[dict]:
+    """Read every JSONL line from each path, tagging rows with their file stem as `source`."""
+    rows: list[dict] = []
+    for p in paths:
+        stem = Path(p).stem
+        for line in Path(p).read_text().splitlines():
+            if line.strip():
+                row = json.loads(line)
+                row["source"] = stem
+                rows.append(row)
+    return rows
 
 
-# TODO: def build_dataset(cfg) -> Dataset | DatasetDict:
-#   1. rows = load_all(cfg)
-#   2. ds = Dataset.from_list(rows)
-#   3. optional: dedup identical (messages, completion) pairs (e.g. hash the json of each).
-#   4. optional: ds.train_test_split(test_size=...) -> DatasetDict({"train":..., "test":...}).
-#   5. return ds. Print len(ds) and ds.features for a dry-run sanity check BEFORE pushing.
+def main(argv: list[str] | None = None) -> None:
+    load_dotenv()
+    ap = argparse.ArgumentParser(description="Combine SFT JSONL and push to the HuggingFace Hub.")
+    ap.add_argument("--inputs", nargs="+", default=DEFAULT_INPUTS, help="SFT JSONL files to combine")
+    ap.add_argument("--repo-id", default=os.environ.get("HF_HUB_REPO_ID"), help="Hub dataset repo id")
+    ap.add_argument("--public", dest="private", action="store_false", default=True, help="push as a public dataset")
+    ap.add_argument("--test-size", type=float, default=0.0, help="if >0, make a seeded train/test split")
+    ap.add_argument("--dry-run", action="store_true", help="build + report stats, do NOT push (no token needed)")
+    args = ap.parse_args(argv)
+
+    from datasets import Dataset  # lazy: only pushing needs `datasets`
+
+    rows = load_rows(args.inputs)
+    ds = Dataset.from_list(rows)
+
+    print(f"rows: {len(ds)}  |  columns: {ds.column_names}")
+    print("by source :", dict(Counter(r["source"] for r in rows)))
+    print("has_think :", dict(Counter(r["has_think"] for r in rows)))
+
+    if args.test_size > 0:
+        ds = ds.train_test_split(test_size=args.test_size, seed=0)
+        print("split     :", {k: len(v) for k, v in ds.items()})
+
+    if args.dry_run:
+        print("dry-run: built the dataset but did NOT push.")
+        return
+
+    if not args.repo_id:
+        raise SystemExit("No repo id — set HF_HUB_REPO_ID in .env or pass --repo-id.")
+    if not os.environ.get("HF_TOKEN"):
+        raise SystemExit("No HF_TOKEN — set a write token in .env (huggingface.co/settings/tokens).")
+
+    ds.push_to_hub(args.repo_id, private=args.private)
+    print(f"pushed -> https://huggingface.co/datasets/{args.repo_id}")
 
 
-# TODO: def push(cfg, *, private=True) -> None:
-#   - ds = build_dataset(cfg)
-#   - guard: require cfg.hub_repo_id is set (else raise with a helpful message).
-#   - ds.push_to_hub(cfg.hub_repo_id, private=private)
-#   - tip: print the resulting https://huggingface.co/datasets/<repo_id> URL.
-#
-# Verification: push to a throwaway repo first, then `load_dataset(repo_id)` and assert
-# the row count / features round-trip.
+if __name__ == "__main__":
+    main()

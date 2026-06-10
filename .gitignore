@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Distillation data — generated locally, lives on the HuggingFace Hub (not in git).
+# Regenerate with `python -m distillation.batch_play`; consumers use `load_dataset(...)`.
+distillation/data/

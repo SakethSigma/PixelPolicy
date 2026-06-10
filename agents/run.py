@@ -39,28 +39,34 @@ def main(argv: Optional[list[str]] = None) -> None:
                    help="demo: wait for Enter per move")
     p.add_argument("--base-url", default=None, help="override OPENAI_BASE_URL")
     p.add_argument("--model", default=None, help="override INFERENCE_MODEL")
+    p.add_argument("--backend", choices=["qwen", "claude"], default="qwen",
+                   help="qwen = local vLLM (OpenAI-compat); claude = Anthropic teacher")
+    p.add_argument("--claude-model", default="claude-sonnet-4-6",
+                   help="Anthropic model id when --backend claude")
     args = p.parse_args(argv)
 
     cfg = AgentConfig.from_env()
-    # local: only running needs openai
+    # local: only running needs the client libs
     from agents.backend import OpenAICompatBackend, AnthropicBackend
 
-    backend = OpenAICompatBackend(
-        base_url=args.base_url or cfg.base_url,
-        model=args.model or cfg.model,
-        api_key=cfg.api_key,
-        temperature=cfg.temperature,
-        max_tokens=cfg.max_tokens,
-        top_p=cfg.top_p,
-        presence_penalty=cfg.presence_penalty,
-        top_k=cfg.top_k,
-        enable_thinking=cfg.enable_thinking,
-    )
-    backend = AnthropicBackend(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        effort="high"
-    )
+    if args.backend == "claude":
+        backend = AnthropicBackend(
+            model=args.claude_model,
+            max_tokens=4096,
+            effort="high",
+        )
+    else:
+        backend = OpenAICompatBackend(
+            base_url=args.base_url or cfg.base_url,
+            model=args.model or cfg.model,
+            api_key=cfg.api_key,
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            top_p=cfg.top_p,
+            presence_penalty=cfg.presence_penalty,
+            top_k=cfg.top_k,
+            enable_thinking=cfg.enable_thinking,
+        )
 
     bank = WordBank()
 

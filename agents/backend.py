@@ -146,6 +146,8 @@ class AnthropicBackend:
         prompts: list[list[dict]],
         *,
         poll_interval: float = 5.0,
+        on_created=None,
+        resume_batch_id: str | None = None,
         **sampling: Any,
     ) -> list[Completion]:
         """Same contract as :meth:`generate`, but via the **Message Batches API**.
@@ -158,24 +160,55 @@ class AnthropicBackend:
         Batches process within 24h (usually minutes); ``poll_interval`` seconds between
         status checks. Failed requests come back with ``text=""`` and ``finish_reason`` set
         to the failure type (e.g. ``"errored"``), with the error payload in ``raw``.
+
+        **Resilience.** A batch is durable on Anthropic's side (runs server-side, results
+        kept ~29 days), so a dropped connection only kills the local poller, not the batch:
+
+        - ``on_created(batch_id)`` fires the instant the batch is created — persist the id so
+          a crash mid-poll is recoverable.
+        - ``resume_batch_id`` skips creation and re-attaches to an existing batch (fetches
+          its results when ready) — no re-submit, so no double cost. ``prompts`` is then only
+          used for its length/order expectation and may be the same list you submitted.
+        - The poll + results reads are idempotent GETs, so transient network errors are
+          retried with backoff instead of raising (waits out the outage, then continues).
         """
+        from anthropic import APIConnectionError  # APITimeoutError is a subclass
+
         max_tokens = sampling.get("max_tokens", self._max_tokens)
         effort = sampling.get("effort", self._effort)
-        requests = [
-            {
-                "custom_id": f"req-{i}",
-                "params": self._create_params(messages, max_tokens=max_tokens, effort=effort),
-            }
-            for i, messages in enumerate(prompts)
-        ]
-        batch = self._client.messages.batches.create(requests=requests)
-        while batch.processing_status != "ended":
-            time.sleep(poll_interval)
-            batch = self._client.messages.batches.retrieve(batch.id)
 
-        by_id = {entry.custom_id: entry for entry in self._client.messages.batches.results(batch.id)}
+        def _resilient(call):
+            """Retry an idempotent read through transient network drops (batch survives)."""
+            backoff = poll_interval
+            while True:
+                try:
+                    return call()
+                except APIConnectionError:
+                    time.sleep(min(backoff, 60.0))
+                    backoff = min(backoff * 1.5, 60.0)
+
+        if resume_batch_id is None:
+            requests = [
+                {
+                    "custom_id": f"req-{i}",
+                    "params": self._create_params(messages, max_tokens=max_tokens, effort=effort),
+                }
+                for i, messages in enumerate(prompts)
+            ]
+            # NOT wrapped in _resilient: a retried create could spawn a duplicate (double cost).
+            batch_id = self._client.messages.batches.create(requests=requests).id
+        else:
+            batch_id = resume_batch_id
+        if on_created is not None:
+            on_created(batch_id)
+
+        while _resilient(lambda: self._client.messages.batches.retrieve(batch_id)).processing_status != "ended":
+            time.sleep(poll_interval)
+
+        entries = _resilient(lambda: list(self._client.messages.batches.results(batch_id)))
+        by_id = {entry.custom_id: entry for entry in entries}
         out: list[Completion] = []
-        for i in range(len(prompts)):
+        for i in range(len(by_id)):  # results count, so this works for both fresh and resumed runs
             result = by_id[f"req-{i}"].result
             if result.type == "succeeded":
                 msg = result.message

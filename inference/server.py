@@ -70,6 +70,13 @@ def main(argv: list[str] | None = None) -> None:
     # env var). `setdefault` lets you override the sampler choice via the environment.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
+    # Force vLLM's v1 model runner. The v2 runner (default-on for plain CausalLM archs like
+    # Qwen3ForCausalLM) allocates UVA buffers, which require pinned host memory — and WSL
+    # forces `pin_memory=False`, so v2 dies at device init with `RuntimeError: UVA is not
+    # available`. The v1 runner has no such dependency and serves the same models fine.
+    # `setdefault` lets you re-enable v2 (`VLLM_USE_V2_MODEL_RUNNER=1`) on a non-WSL box.
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+
     cmd = [
         "vllm", "serve", args.model,
         "--host", args.host,
