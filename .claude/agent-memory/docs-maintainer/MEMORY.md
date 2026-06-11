@@ -1,0 +1,2 @@
+- [Docs map & conventions](repo_docs_map.md) — where each in-scope .md lives, plan-* files to skip, style notes
+- [Distillation dataset facts](distillation_dataset.md) — unified SFT schema, Hub dataset id, row counts
