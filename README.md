@@ -10,7 +10,7 @@ PixelPolicy is a modular research framework for training and evaluating LLMs and
 
 The repo is organized around five clear responsibilities:
 
-**`games/`** — Each game is an isolated FastAPI server. Games expose a standard REST interface (reset, step, render, valid actions) so any agent can play any game without game-specific logic leaking into agent or training code. Each game lives in its own subdirectory with its own `pyproject.toml`, keeping dependencies isolated.
+**`games/`** — Each game is an isolated FastAPI server. Games expose a standard REST interface (reset, step, render, valid actions) so any agent can play any game without game-specific logic leaking into agent or training code. Each game lives in its own subdirectory with its own `pyproject.toml`, keeping dependencies isolated. Today the repo ships **Wordle** (the multi-turn reference game) and **`charcount`** — the first of a planned family of single-turn *word-skill* games that broaden the word model beyond Wordle (see [`games/DATA_SOURCING.md`](games/DATA_SOURCING.md)). A shared support package, **`games/wordvocab/`**, supplies the common multi-length vocabulary those games draw from.
 
 **`agents/`** — Agents are thin wrappers over models reached through an OpenAI-compatible API (a local model via vLLM, or a hosted OpenAI/Claude endpoint). They receive a game observation and return an action. Keeping agents lightweight means the interesting logic lives in training, not in agent scaffolding.
 
@@ -35,15 +35,18 @@ PixelPolicy/
 ├── .env                    # your keys (gitignored)
 ├── .env.example
 ├── games/
-│   ├── wordle/             # the reference game
+│   ├── wordle/             # the reference game (multi-turn)
 │   │   ├── pyproject.toml  # fastapi, uvicorn, (rich for the [tui])
 │   │   ├── game.py         # pure core    server.py  client.py  render.py  play.py
 │   │   └── ...
+│   ├── charcount/          # word-skill game #1 (single-turn) — same layout as wordle
+│   ├── wordvocab/          # shared multi-length vocab.txt + game-salted split (support pkg)
 │   └── <game>/             # add new games here (same layout)
 ├── agents/
-│   ├── pyproject.toml      # openai, pydantic, python-dotenv, game-wordle ([tui]=rich)
+│   ├── pyproject.toml      # openai, pydantic, python-dotenv, game-wordle, game-charcount ([tui]=rich)
 │   ├── base.py backend.py rollout.py run.py config.py
-│   └── wordle/agent.py     # the only Wordle-aware agent code
+│   ├── wordle/agent.py     # the only Wordle-aware agent code
+│   └── charcount/agent.py  # the only charcount-aware agent code (single-turn)
 ├── training/
 │   ├── pyproject.toml      # torch, transformers, datasets
 │   └── ...
@@ -52,8 +55,11 @@ PixelPolicy/
 │   └── server.py           # thin launcher over `vllm serve`
 └── distillation/
     ├── pyproject.toml      # anthropic, datasets, huggingface-hub
-    ├── batch_play.py       # lockstep Batch-API teacher rollouts (game-agnostic)
-    ├── registry.py         # GameSpec per game — the one place a new game is added
+    ├── schema.py           # the unified SFT row schema (every game shares one shape)
+    ├── batch_play.py       # lockstep Batch-API teacher rollouts (reasoning games)
+    ├── programmatic.py     # no-Claude "synthetic teacher" → SFT (e.g. charcount)
+    ├── reexport.py         # re-shape a raw Claude dump → current schema (no re-run)
+    ├── registry.py         # GameSpec + GAME_NUMBERS — the one place a new game is added
     ├── push.py             # combine SFT samples → datasets.Dataset → Hub
     └── cost_probe.py       # measure teacher cost at a given reasoning effort
 ```
@@ -110,30 +116,43 @@ A Wordle-fine-tuned model plays far better than the base model — host it with
 **[agents/wordle/README.md](agents/wordle/README.md)** (exact prompts/parsing per round), and
 **[inference/README.md](inference/README.md)**.
 
-### Play Wordle yourself / run the game's HTTP server
+### Play a game yourself / run its HTTP server
 
 ```bash
-uv run --package game-wordle python -m games.wordle.play        # play in the terminal
-uv run --package game-wordle uvicorn games.wordle.server:app    # the game's REST API
+uv run --package game-wordle python -m games.wordle.play        # play Wordle in the terminal
+uv run --package game-wordle uvicorn games.wordle.server:app    # Wordle's REST API
+
+uv run --package game-charcount python -m games.charcount.play  # play Character counts (single-turn)
+uv run --package game-charcount uvicorn games.charcount.server:app
 ```
+
+Every game follows the same `play.py` / `server.py` / `client.py` layout, so the commands
+only differ by package name. See **[games/wordle/README.md](games/wordle/README.md)** and
+**[games/charcount/README.md](games/charcount/README.md)**.
 
 ### Generate teacher data (distillation)
 
-Have a strong model (Claude) play many games, export per-move SFT samples, and push them to
-the HuggingFace Hub — to later fine-tune a small open model on the teacher's play. Uses the
-same game loop as inference (the teacher is just a Claude backend). Needs `ANTHROPIC_API_KEY`;
-pushing also needs `HF_TOKEN` + `HF_HUB_REPO_ID` in `.env`.
+Build SFT data for every game, combine it into one dataset under a **unified schema**, and
+push to the HuggingFace Hub — to later fine-tune a small open model. There are two producers:
+**Claude-distilled** (reasoning games like Wordle, via the Anthropic Batch API — needs
+`ANTHROPIC_API_KEY`) and **programmatic** (no-reasoning games like `charcount`, where a
+"synthetic teacher" writes the gold answer — zero API cost). Pushing needs `HF_TOKEN` +
+`HF_HUB_REPO_ID` in `.env`.
 
 ```bash
-# play N games via the Anthropic Batch API (~50% cheaper); writes raw + per-move SFT JSONL.
+# Wordle: play N games via the Anthropic Batch API (~50% cheaper); writes raw + per-move SFT JSONL.
 # --effort low|medium|high trades cost for reasoning depth (see distillation/blog_notes.md).
 uv run --package distillation python -m distillation.batch_play --game wordle --episodes 100 --effort low
 
-# combine all SFT samples into one dataset and push to the Hub (90/10 split)
+# charcount: generate SFT rows programmatically (no Claude; default ~14k rows, self-checked)
+uv run --package distillation python -m distillation.programmatic
+
+# combine every game's SFT into one dataset and push to the Hub (90/10 split)
 uv run --package distillation python -m distillation.push --test-size 0.1
 ```
 
-Example dataset: **[saketh-chervu/word-games-distillation](https://huggingface.co/datasets/saketh-chervu/word-games-distillation)**.
+Example dataset: **[saketh-chervu/word-games-distillation](https://huggingface.co/datasets/saketh-chervu/word-games-distillation)**
+— 17,078 rows (3,078 Wordle + 14,000 charcount).
 See **[distillation/README.md](distillation/README.md)** for the pipeline and **[distillation/blog_notes.md](distillation/blog_notes.md)** for the cost/effort story.
 
 ---
@@ -143,6 +162,12 @@ See **[distillation/README.md](distillation/README.md)** for the pipeline and **
 1. Create `games/<your-game>/` with a `pyproject.toml` and a `server.py` that implements the standard game interface.
 2. Run `uv sync` to pick it up in the workspace.
 3. The game is immediately playable by any existing agent.
+
+To also produce training data for the new game, add one `GameSpec` entry in
+`distillation/registry.py` (see **[distillation/README.md](distillation/README.md)**). For the
+single-turn *word-skill* family specifically, **[`games/DATA_SOURCING.md`](games/DATA_SOURCING.md)**
+and **[`games/CODE_IMPLEMENTATION.md`](games/CODE_IMPLEMENTATION.md)** are the design docs, and
+`games/charcount/` + `games/wordvocab/` are the reference implementations to mirror.
 
 ---
 

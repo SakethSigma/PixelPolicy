@@ -6,7 +6,11 @@ game must not require changes to agent or training code, and a new agent must no
 changes to any game.** Each task is a full game-env package mirroring `games/wordle/`, plus
 a per-task agent and one distillation registry entry.
 
-> Status: design doc. No code is written yet — this is the spec we'll build from.
+> Status: partially built. **Game #1 (`charcount`)** and the **shared vocabulary asset
+> (`games/wordvocab/`)** are implemented, along with the **programmatic generator**
+> (`distillation/programmatic.py`) and a **unified SFT schema** (`distillation/schema.py`)
+> shared by every game. Games 2–6 remain a spec to build from. Where the built code's names
+> differ from this doc's proposals, the notes below flag the real names.
 
 ---
 
@@ -84,23 +88,31 @@ Implement the existing `GameAgent` protocol (`agents/base.py`); reuse `base.py`,
 
 ## Distillation wiring — one registry entry per task
 
-`distillation/generate.py`, `dataset.py`, and `push.py` stay game-agnostic; a new task is
-added **only** in [`distillation/registry.py`](../distillation/registry.py) as a `GameSpec`:
-`make_agent`, `make_bank` (loads the word list/split once, shared across episodes),
-`reset_env`, and `sample_target`. This is the same one-place-to-add-a-game contract the
-distillation README describes.
+`distillation/batch_play.py`, `programmatic.py`, `schema.py`, and `push.py` stay
+game-agnostic; a new task is added **only** in
+[`distillation/registry.py`](../distillation/registry.py) as a `GameSpec` (plus its number in
+`GAME_NUMBERS`). As built, `charcount`'s spec carries `make_agent`, `make_bank` (loads the
+word list/split once, shared across episodes), `reset_env`, `sample_target`, and a
+`good_status` field (here `"correct"`) that tells the rejection filter which terminal status
+counts as solved. This is the same one-place-to-add-a-game contract the distillation README
+describes.
 
 ### Two producers, one SFT shape
 
-Both emit the existing `{game, messages, completion}` rows (`distillation/dataset.py`), so
-the combine + `push.py` step is unchanged.
+Both emit the **unified SFT schema** defined in
+[`distillation/schema.py`](../distillation/schema.py) (`sft_row`) — `game_name`, `game_no`,
+`round`, `valid`, `target`, `system`, `messages`, `completion`, `completion_no_think`,
+`has_think`, `episode` — so the combine + `push.py` step is unchanged. (The legacy Wordle
+rows, whose `game` column was the episode index, are upgraded on load by
+`schema.normalize_legacy`.)
 
 **A. Programmatic generator (games 1, 2, 4, 5) — no Claude.**
 Step the env, read the gold answer the core computed, and format it into the completion (a
-trivial "synthetic teacher"). Emit `{game, messages: build_messages(state), completion}`
-directly. No API cost, fully reproducible. This is a small new helper (e.g.
-`distillation/programmatic.py`) that loops the bank and writes SFT JSONL — it does **not**
-touch the generic pipeline.
+trivial "synthetic teacher"). No API cost, fully reproducible. This is
+[`distillation/programmatic.py`](../distillation/programmatic.py) (already built for
+`charcount`): it loops the bank, self-checks each label, and writes unified-schema SFT JSONL
+without touching the generic pipeline. Its charcount default emits 14,000 rows (≥4,000
+Wordle-vocab words + 10,000 WordNet words spanning lengths 3–20).
 
 **B. Batch distillation (games 3, 6) — Claude + rejection.**
 These want reasoning, and being single-turn they fit the **Anthropic Batch API** directly —
@@ -111,8 +123,8 @@ exactly these games). Reuse:
   returns `Completion`s in input order with full `raw`/`usage`.
 - `run_eval` (`agents/rollout.py`) for the live path, or a thin batch driver modeled on
   `distillation/batch_play.py` for the batch path (single round, since one turn).
-- `dataset.py` **filter + explode** — unchanged: keep solved episodes, then one
-  `{messages, completion}` per move (here, one move per episode).
+- the **filter + explode** step — keep solved episodes, then one row per move (here, one
+  move per episode), emitted in the unified schema by `batch_play.py`'s SFT writer.
 - Cost/safety from `distillation/cost_probe.py`: the `PRICING` table and
   `with_options(timeout=…, max_retries=0)` (a retried in-flight request is **billed twice**
   — the double-billing guard noted in `batch_play.md`).
@@ -122,9 +134,10 @@ exactly these games). Reuse:
 The Wordle filter keeps episodes with `final.status == "won"`. Here the core sets a terminal
 `status` (e.g. `"correct"`) when `step(answer)` matches its ground truth, so the **same
 filter** keeps only correct traces — programmatic samples pass by construction, and Claude
-traces that reasoned to a wrong answer are dropped. `dataset.py` needs at most a tiny tweak
-to treat the per-task "good" status like `"won"` (or we standardize the terminal status name
-across tasks so it needs no change at all).
+traces that reasoned to a wrong answer are dropped. As built, each game declares its terminal
+"good" status in its `GameSpec.good_status` (`"won"` for Wordle, `"correct"` for charcount),
+and the unified schema records the outcome in the row's `valid` flag — so the gate is
+game-agnostic with no per-task special-casing.
 
 ---
 
@@ -143,30 +156,34 @@ Add these to the relevant `pyproject.toml`s (the game packages that need them, a
 
 ## Shared vocabulary build
 
-A small script (e.g. `games/wordvocab/build.py`) produces the multi-length word list +
-**per-game** splits described in
-[DATA_SOURCING.md](DATA_SOURCING.md#shared-vocabulary-asset): take WordNet lemmas, filter to
-lowercase-alpha single tokens in a length range, **union with the full Wordle vocab**
-(train + val), then split **per game** with a game-salted rule —
-`assign_pool(game, word) = sha256(f"{game}:{word}") % 1000 < 200 → val else train` (a salted
-variant of [`games/wordle/game.py`](wordle/game.py)'s `assign_pool`). This is the deliberate
-cross-game design: a word that's val for one game (e.g. a Wordle val word) is train for
-another. After splitting, **verify the union of all games' train sets covers the vocab**,
-forcing any straggler into a game's train, so **every word is trained in at least one game**.
-Commit the per-game artifacts so splits are reproducible; regeneration is a run-on-purpose
-step. Wordle keeps its existing unsalted committed split.
+Built as [`games/wordvocab/`](wordvocab/README.md). `build.py` produces the multi-length word
+list described in [DATA_SOURCING.md](DATA_SOURCING.md#shared-vocabulary-asset): take WordNet
+lemmas, filter to lowercase-alpha single tokens in length range **3–20**, **union with the
+full Wordle vocab** (train + val, 12,972 words), and commit the result as `vocab.txt` (so
+downstream packages read it with **no `nltk`** at runtime — `nltk` is only the `[build]`
+extra). `split.py::assign_pool(game, word)` then splits **per game** with a game-salted rule —
+`sha256(f"{game}:{word}") % 1000 < 200 → val else train` (a salted variant of
+[`games/wordle/game.py`](wordle/game.py)'s `assign_pool`). This is the deliberate cross-game
+design: a word that's val for one game (e.g. a Wordle val word) is train for another. Because
+`assign_pool` is deterministic, banks derive their split at load time with **no per-game
+artifact to commit**; regenerating `vocab.txt` is a run-on-purpose step. Wordle keeps its
+existing unsalted committed split.
 
 ---
 
 ## Build order (suggested)
 
-1. **Vocabulary asset** — the multi-length list + extended split (everything else depends on
-   it).
+1. **Vocabulary asset** — the multi-length list + salted split. ✅ **Built**
+   (`games/wordvocab/`).
 2. **Programmatic games** (1, 2, 4, 5) — package + agent + programmatic generator. Cheap,
-   no API, validates the single-turn game shape end to end.
+   no API, validates the single-turn game shape end to end. **Game #1 `charcount` is built**
+   (package, agent, and `distillation/programmatic.py`); games 2, 4, 5 remain.
 3. **Reasoning games** (3, 6) — package + agent + registry entries; wire the Batch
-   distillation path and confirm rejection sampling drops wrong traces.
-4. **Combine + push** — unchanged `push.py`; one Hub dataset across all games.
+   distillation path and confirm rejection sampling drops wrong traces. Not yet built.
+4. **Combine + push** — unchanged `push.py`; one Hub dataset across all games. **Done** for
+   Wordle + charcount (pushed to
+   [`saketh-chervu/word-games-distillation`](https://huggingface.co/datasets/saketh-chervu/word-games-distillation),
+   17,078 rows = 3,078 Wordle + 14,000 charcount).
 
 ---
 
@@ -175,8 +192,8 @@ step. Wordle keeps its existing unsalted committed split.
 - Per-game `tests/` (core scoring, render parity, Local/HTTP client parity) — mirror
   `games/wordle/tests/`.
 - **Train == inference:** for a fresh agent, `build_messages(reset_state)` equals the
-  `messages` stored in the produced SFT sample (the same assertion the Wordle
-  [`dataset.py`](../distillation/dataset.py) suggests).
+  `messages` stored in the produced SFT sample (the byte-identical-to-inference guarantee the
+  unified schema in [`schema.py`](../distillation/schema.py) preserves).
 - **Programmatic correctness:** generated `<answer>` matches an independent recomputation of
   the label for a sample of words.
 - **Rejection works:** on a small Claude batch for games 3/6, confirm wrong-answer traces

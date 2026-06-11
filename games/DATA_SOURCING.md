@@ -17,6 +17,11 @@ This doc is about **what data we make and where the ground truth comes from**. F
 wired into the repo (game packages, agents, the distillation pipeline), see
 [CODE_IMPLEMENTATION.md](CODE_IMPLEMENTATION.md).
 
+> Status: partially built. **Game #1 (Character counts)** ships as the `charcount` package,
+> the **shared vocabulary asset** ships as `games/wordvocab/`, and the **programmatic
+> producer** + **unified SFT schema** are implemented in `distillation/`. Its data is in the
+> combined Hub dataset alongside Wordle. Games 2–6 are still spec.
+
 ---
 
 ## Design principles
@@ -29,8 +34,10 @@ wired into the repo (game packages, agents, the distillation pipeline), see
   correct answer and scores a submission. This is what lets the same rejection-sampling
   filter work for every game (see [Two data-production modes](#two-data-production-modes)).
 - **One SFT shape for everything.** Whether a sample is built programmatically or distilled
-  from Claude, it ends up as `{game, messages, completion}` — byte-identical to what the
-  student model sees at inference. Identical to the existing Wordle distillation output.
+  from Claude, it ends up in the unified schema (`distillation/schema.py`) — keyed by
+  `game_name`/`game_no` and carrying `messages` + `completion` that are byte-identical to what
+  the student model sees at inference. The legacy Wordle distillation rows are normalized into
+  this same shape, so every game shares one row format.
 - **Single-turn.** Unlike Wordle, every task is one prompt → one reply. This makes the
   Anthropic **Batch API** a natural fit for the reasoning games (no lockstep needed).
 
@@ -38,8 +45,8 @@ wired into the repo (game packages, agents, the distillation pipeline), see
 
 ## Two data-production modes
 
-Both emit the same `{game, messages, completion}` rows; they differ only in *who writes the
-completion*.
+Both emit the same unified-schema rows (`distillation/schema.py`); they differ only in *who
+writes the completion*.
 
 **A. Programmatic (no Claude) — games 1, 2, 4, 5.**
 The label is cheap and exact, and no chain-of-thought is wanted. A tiny "synthetic teacher"
@@ -62,13 +69,16 @@ the env scoring a one-shot answer instead of a 6-round game.
 
 All games draw seed words from one **multi-length** word list with **per-game** deterministic
 train/val splits. The deliberate design: **a word that is val for one game is train for
-another, so the model becomes familiar with every word.**
+another, so the model becomes familiar with every word.** This asset is **built** as
+`games/wordvocab/` (committed `vocab.txt` + `assign_pool`); see its
+[README](wordvocab/README.md).
 
 - **One vocabulary.** The full pool = the Wordle vocabulary (its `train_words.txt` +
   `val_words.txt`, all 12,972 words) **unioned** with a multi-length augmentation from
-  WordNet lemmas (`wn.all_lemma_names()`, filtered to lowercase-alpha single tokens in a
-  sensible length range). WordNet gives length variety *and* guarantees every word has a
-  definition (needed by games 2 and 6).
+  WordNet lemmas (`wn.all_lemma_names()`, filtered to lowercase-alpha single tokens of length
+  **3–20**). WordNet gives length variety *and* guarantees every word has a definition (needed
+  by games 2 and 6). The result is committed as `vocab.txt`, so downstream packages read it
+  with **no `nltk`** at runtime (`nltk` is only the wordvocab `[build]` extra).
 - **Each game splits independently — this is the whole point.** A word's pool is assigned
   *per game* by a **game-salted** hash:
   `assign_pool(game, word) = sha256(f"{game}:{word}") % 1000 < 200 → val else train`.
@@ -96,13 +106,15 @@ another, so the model becomes familiar with every word.**
 For each: the input **X**, the output **Y** (with exact tags), the offline ground-truth
 source, and the production mode.
 
-### 1. Character counts / vowels / consonants — *programmatic, no reasoning*
+### 1. Character counts / vowels / consonants — *programmatic, no reasoning* — ✅ **built (`charcount`)**
 
 Teaches the model to map a word to its characters (useful for the word↔token boundary).
+Shipped as the `games/charcount/` package; see its [README](charcount/README.md).
 
 - **X:** a word (any length).
 - **Y:** an `<answer>` block giving overall length, the vowels (list + count), and the
-  consonants (list + count). No `<think>`.
+  consonants (list + count). No `<think>`. As built, letters are **space-separated and
+  UPPERCASE**; `y` is a consonant.
 - **Ground truth:** pure Python — iterate the characters, classify against `aeiou`.
 - **Example**
 
@@ -110,8 +122,8 @@ Teaches the model to map a word to its characters (useful for the word↔token b
   X:  Word: planet
   Y:  <answer>
       length: 6
-      vowels (2): a, e
-      consonants (4): p, l, n, t
+      vowels (2): A E
+      consonants (4): P L N T
       </answer>
   ```
 
@@ -242,7 +254,7 @@ Teaches meaning + partial-pattern → word retrieval (the core crossword skill).
 
 | # | Game | Format | Reasoning? | Offline source | Producer |
 |---|------|--------|:----------:|----------------|----------|
-| 1 | Char counts | free `<answer>` | no | Python (char classify) | programmatic |
+| 1 | Char counts ✅ | free `<answer>` | no | Python (char classify) | programmatic |
 | 2 | Validity + meaning | `<answer>` (+`<meaning>`) | no | WordNet (NLTK) | programmatic |
 | 3 | Anagrams | `<think>`+`<answer>` | yes | `sorted()` check | Claude + rejection |
 | 4 | Ends→starts | MCQ `<answer>` | no | Python (char match) | programmatic |

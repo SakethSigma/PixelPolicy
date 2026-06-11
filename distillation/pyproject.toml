@@ -11,11 +11,13 @@ dependencies = [
     "pydantic>=2.0.0",          # Trajectory/Turn round-trip
     "agents",                   # run_eval, Trajectory, AnthropicBackend, the per-game agents
     "game-wordle",              # WordBank / LocalWordleClient for the Wordle rollouts
+    "game-charcount",           # charcount bank/client for the programmatic generator
 ]
 
 [tool.uv.sources]
 agents = { workspace = true }
 game-wordle = { workspace = true }
+game-charcount = { workspace = true }
 
 [tool.uv]
 # Flat-layout namespace package imported via the workspace `pythonpath`, not built as a

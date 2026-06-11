@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import re
 from collections import Counter
 from pathlib import Path
 
@@ -33,7 +32,8 @@ from dotenv import load_dotenv
 
 from agents.backend import AnthropicBackend
 from agents.base import Turn
-from distillation.registry import GAMES
+from distillation.registry import GAME_NUMBERS, GAMES
+from distillation.schema import sft_row
 
 # List price, USD per 1M tokens. Cache read = 0.1x input; 5-min cache write = 1.25x.
 PRICING = {
@@ -41,14 +41,6 @@ PRICING = {
     "claude-opus-4-8":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
 }
 BATCH_DISCOUNT = 0.5  # Anthropic Message Batches API is 50% of standard price.
-
-_THINK = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
-
-
-def strip_think(text: str) -> str:
-    """Drop the <think>…</think> block, leaving just the final answer (e.g. <guess>word</guess>)."""
-    return _THINK.sub("", text)
-
 
 def price(totals: dict, model: str, *, discount: float) -> dict:
     p = PRICING[model]
@@ -214,17 +206,19 @@ def main(argv: list[str] | None = None) -> None:
 
     out_sft = Path(args.out_sft)
     out_sft.parent.mkdir(parents=True, exist_ok=True)
+    game_no = GAME_NUMBERS.get(args.game, -1)
     with out_sft.open("w") as f:
         for i, g in enumerate(games):
+            valid = g["status"] == spec.good_status  # solved-episode gate → the `valid` flag
             for t in g["turns"]:
-                f.write(json.dumps({
-                    "game": i, "round": t["round"], "target": g["target"],
-                    "system": agent.system_prompt,
-                    "messages": t["prompt"],                          # byte-identical inference prompt
-                    "completion": t["output"],                        # full <think>…</think><answer>
-                    "completion_no_think": strip_think(t["output"]),  # just the final answer
-                    "has_think": "<think>" in t["output"],            # flag: did the teacher reason here?
-                }, ensure_ascii=False) + "\n")
+                row = sft_row(
+                    game_name=args.game, game_no=game_no, round=t["round"], target=g["target"],
+                    system=agent.system_prompt,
+                    messages=t["prompt"],   # byte-identical inference prompt
+                    completion=t["output"],  # full <think>…</think><answer>
+                    valid=valid, episode=i,
+                )
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"\n— {args.game} | {args.model} | effort={args.effort} | {n} games —")
     print("  outcomes:", dict(Counter(g["status"] for g in games)))

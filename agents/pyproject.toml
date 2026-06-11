@@ -8,6 +8,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "game-wordle",          # reuse render_observation / WordleClient / render_board
+    "game-charcount",       # charcount agent reuses its render_observation
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,7 @@ dev = [
 
 [tool.uv.sources]
 game-wordle = { workspace = true }
+game-charcount = { workspace = true }
 
 [tool.uv]
 # Flat-layout namespace package imported via the workspace `pythonpath`, not built as a

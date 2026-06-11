@@ -44,22 +44,67 @@ uv run --package distillation python -m distillation.run push --dry-run
 uv run --package distillation python -m distillation.run push
 ```
 
+## Unified SFT schema (one row shape for every game)
+
+Every row — Wordle (Claude-distilled) and the single-turn word-skill games (programmatic) —
+shares the same columns, defined once in [`schema.py`](schema.py):
+
+| column | meaning |
+|--------|---------|
+| `game_name` / `game_no` | `"wordle"` / `0`, `"charcount"` / `1`, … (numbering per [`games/DATA_SOURCING.md`](../games/DATA_SOURCING.md)) |
+| `round` | move number within the episode (single-turn games are always `1`) |
+| `valid` | passed the solved gate (`status == good_status`): `won` for Wordle, `correct` for single-turn |
+| `target` / `system` / `messages` / `completion` | the answer, prompt, and reply (byte-identical to inference) |
+| `completion_no_think` / `has_think` | reply with `<think>` stripped + a flag |
+| `episode` | per-run episode index |
+
+`push.py` upgrades any *legacy* row (the original Wordle SFT, whose `game` field was the
+episode index) on load, so old and new files combine without re-running rollouts.
+
+## Two producers
+
+- **Claude-distilled** (reasoning games, e.g. Wordle): [`batch_play.py`](batch_play.py) →
+  raw `*_raw.json` + SFT `*_sft.jsonl`. Raw is the source of truth; re-shape SFT anytime with
+  [`reexport.py`](reexport.py) (no Claude re-run).
+- **Programmatic** (no-reasoning games, e.g. charcount): [`programmatic.py`](programmatic.py)
+  formats the env's gold answer straight into the completion — zero API cost, fully reproducible.
+
+```bash
+# programmatic game (charcount): generate SFT rows (seeded, self-checked).
+# default = 14k rows: >=4k Wordle-vocab words + the rest from WordNet (lengths 3-20).
+uv run --package distillation python -m distillation.programmatic
+
+# re-shape existing Claude raw dumps into the current SFT schema (no Claude)
+uv run --package distillation python -m distillation.reexport distillation/data/batch_*_raw.json
+
+# combine every game + push. --overwrite wipes the Hub repo's old shards/card first
+# (required after a schema change); --dry-run reports stats without a token.
+uv run --package distillation python -m distillation.push --dry-run
+uv run --package distillation python -m distillation.push --overwrite
+```
+
+Example combined dataset:
+**[saketh-chervu/word-games-distillation](https://huggingface.co/datasets/saketh-chervu/word-games-distillation)**
+— 17,078 rows (3,078 Wordle + 14,000 charcount).
+
 ## Adding a game
 
-A new game's teacher data needs **only** a `GameSpec` entry in
-[`registry.py`](registry.py) (its agent already lives in `agents/<game>/`). `generate.py`,
-`dataset.py`, and `push.py` are game-agnostic and don't change.
+A new game's data needs **only** a `GameSpec` entry in [`registry.py`](registry.py) (its agent
+already lives in `agents/<game>/`) plus its `game_no` in `GAME_NUMBERS`. `batch_play.py`,
+`programmatic.py`, `schema.py`, and `push.py` are game-agnostic and don't change. Reasoning
+games go through `batch_play.py`; programmatic games add a small loop like charcount's.
 
 ## Files
 
 | File | Role |
 |------|------|
-| [`config.py`](config.py) | `DistillConfig.from_env()` — teacher model/effort, Hub repo id, data paths |
-| [`registry.py`](registry.py) | `GAMES` — per-game wiring (the only place a new game is added) |
-| [`generate.py`](generate.py) | teacher rollouts via `run_eval` → raw `Trajectory` JSONL |
-| [`dataset.py`](dataset.py) | filter solved + explode → per-move SFT JSONL |
-| [`push.py`](push.py) | combine games → `datasets.Dataset` → `push_to_hub` |
-| [`run.py`](run.py) | CLI: `generate` / `build` / `push` |
+| [`schema.py`](schema.py) | the unified SFT row schema; `sft_row` + `normalize_legacy` |
+| [`registry.py`](registry.py) | `GAMES` + `GAME_NUMBERS` — per-game wiring (the only place a new game is added) |
+| [`batch_play.py`](batch_play.py) | lockstep Claude Batch-API rollouts → raw + SFT (reasoning games) |
+| [`programmatic.py`](programmatic.py) | no-Claude "synthetic teacher" → SFT (programmatic games, e.g. charcount) |
+| [`reexport.py`](reexport.py) | re-shape a raw dump → current SFT schema (no Claude re-run) |
+| [`push.py`](push.py) | combine games → `datasets.Dataset` → `push_to_hub` (`--overwrite` for schema changes) |
+| [`cost_probe.py`](cost_probe.py) | measure teacher cost at a given reasoning effort |
 
 ## Config (`.env`)
 

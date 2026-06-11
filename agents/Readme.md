@@ -159,7 +159,9 @@ trajectory) — both of which the rollout holds, so episodes stay reproducible a
 > _Self-contained variant:_ if a game's observation fully captures state and you don't care
 > about preserving the model's reasoning, an agent may instead return a single
 > `render_observation(state)` user message and ignore `history`. That's a deliberate
-> simplification, not the default.
+> simplification, not the default. The single-turn `CharCountAgent`
+> (`agents/charcount/agent.py`) is a worked example: one prompt, one `<answer>` reply,
+> `history` unused.
 
 ---
 

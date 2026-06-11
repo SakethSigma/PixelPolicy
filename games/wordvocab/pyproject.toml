@@ -1,0 +1,16 @@
+[project]
+name = "game-wordvocab"
+version = "0.1.0"
+description = "Shared multi-length vocabulary asset + game-salted split for the word-skill games"
+requires-python = ">=3.11"
+# Runtime is dependency-free: downstream packages read the committed vocab.txt and use the
+# pure-python salted split. nltk is only needed to (re)build vocab.txt — see the [build] extra.
+dependencies = []
+
+[project.optional-dependencies]
+# Only `python -m games.wordvocab.build` needs WordNet: pip install game-wordvocab[build]
+build = ["nltk>=3.8"]
+
+[tool.uv]
+# Flat-layout namespace modules imported via the workspace `pythonpath`, not built as a wheel.
+package = false
