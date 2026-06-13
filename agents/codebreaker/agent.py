@@ -2,8 +2,10 @@
 
 Multi-turn adapter mirroring ``agents/wordle/agent.py``: ``build_messages`` replays the episode as
 a conversation (system → first ask → (guess, feedback)*), and :class:`CodebreakerEnv` maps the
-generic ``step`` onto the client's ``guess`` verb. Programmatic game — the teacher emits a bare
-``<guess>CODE</guess>`` (no ``<think>``); the student learns to turn feedback into the next guess.
+generic ``step`` onto the client's ``guess`` verb. Programmatic game — the teacher emits a short
+worded rationale (from the clues so far) then ``<guess>CODE</guess>``, no ``<think>`` tags. On
+replay only the bare ``<guess>`` is kept (the rationale, like Wordle's ``<think>``, is dropped),
+so the reasoning is a training target without growing the context.
 """
 
 from __future__ import annotations

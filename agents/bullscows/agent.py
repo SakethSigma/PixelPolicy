@@ -2,7 +2,9 @@
 
 Multi-turn adapter mirroring ``agents/wordle/agent.py``: ``build_messages`` replays the episode as
 a conversation, and :class:`BullsCowsEnv` maps the generic ``step`` onto the client's ``guess``
-verb. Programmatic game — the teacher emits a bare ``<guess>1234</guess>`` (no ``<think>``).
+verb. Programmatic game — the teacher emits a short worded rationale (from the bull/cow clues so
+far) then ``<guess>1234</guess>``, no ``<think>`` tags. On replay only the bare ``<guess>`` is
+kept (the rationale, like Wordle's ``<think>``, is dropped).
 """
 
 from __future__ import annotations
