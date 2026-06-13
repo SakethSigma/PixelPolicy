@@ -5,10 +5,15 @@ description = "Training pipelines for game-playing agents"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0.0",
-    "transformers>=4.40.0",
+    "transformers>=4.45.0",
     "datasets>=2.0.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
+    # SFT harness
+    "trl>=0.12.0",              # SFTTrainer + SFTConfig (prompt-completion format → completion-only loss)
+    "accelerate>=0.34.0",      # device placement / launch backing transformers.Trainer
+    "huggingface-hub>=0.20.0", # push individual epoch checkpoints to the Hub
+    "wandb>=0.17.0",           # cross-machine run comparison (free personal tier); --report-to wandb
 ]
 
 [tool.uv]
