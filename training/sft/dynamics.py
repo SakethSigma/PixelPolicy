@@ -26,17 +26,26 @@ def _build_callback():
 
     _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 
-    def _group(name: str) -> str:
+    def _buckets(name: str) -> list[str]:
+        """Buckets a param contributes to. Per transformer block we log the WHOLE block
+        (`layer_NN`) AND its attention (`attn_NN`) / MLP (`mlp_NN`) sub-norms separately, so the
+        viz can split attention vs feed-forward. (Layernorm params count toward `layer_NN` only.)"""
         m = _LAYER_RE.search(name)
         if m:
-            return f"layer_{int(m.group(1)):02d}"
+            nn = f"{int(m.group(1)):02d}"
+            out = [f"layer_{nn}"]
+            if "self_attn" in name:
+                out.append(f"attn_{nn}")
+            elif "mlp" in name:
+                out.append(f"mlp_{nn}")
+            return out
         if "embed" in name:
-            return "embed"
+            return ["embed"]
         if "lm_head" in name:
-            return "lm_head"
-        if "layers." not in name and "norm" in name:
-            return "final_norm"
-        return "other"
+            return ["lm_head"]
+        if "norm" in name:
+            return ["final_norm"]
+        return ["other"]
 
     class GradUpdateNormCallback(TrainerCallback):
         def __init__(self, every: int = 50):
@@ -62,8 +71,9 @@ def _build_callback():
             for n, p in m.named_parameters():
                 if p.grad is None:
                     continue
-                g = _group(n)
-                grad_sq[g] = grad_sq.get(g, 0.0) + p.grad.detach().float().pow(2).sum().item()
+                sq = p.grad.detach().float().pow(2).sum().item()
+                for g in _buckets(n):
+                    grad_sq[g] = grad_sq.get(g, 0.0) + sq
                 snap[n] = p.detach().clone()
             self._grad_norm = {g: v ** 0.5 for g, v in grad_sq.items()}
             self._snap = snap
@@ -78,8 +88,9 @@ def _build_callback():
                 prev = self._snap.get(n)
                 if prev is None:
                     continue
-                g = _group(n)
-                upd_sq[g] = upd_sq.get(g, 0.0) + (p.detach() - prev).float().pow(2).sum().item()
+                sq = (p.detach() - prev).float().pow(2).sum().item()
+                for g in _buckets(n):
+                    upd_sq[g] = upd_sq.get(g, 0.0) + sq
             upd_norm = {g: v ** 0.5 for g, v in upd_sq.items()}
             self._snap = None
             self._log(state, self._grad_norm, upd_norm)
