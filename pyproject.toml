@@ -13,15 +13,12 @@ agents = { workspace = true }
 training = { workspace = true }
 inference = { workspace = true }
 distillation = { workspace = true }
-# Pin torch to the CUDA 12.8 wheel. The default PyPI torch now targets CUDA 13, which fails to
-# initialize on the CUDA-12.8 drivers most cloud GPU hosts (e.g. RunPod) ship. Linux-only so
-# non-Linux dev still resolves torch from PyPI normally.
-torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+# NOTE: do NOT pin torch to a pytorch.org cu128 index here. An `explicit` index routes only `torch`
+# and uv then fails to pull its `nvidia-*-cu12` CUDA libs (→ missing libcudnn.so.9). On cloud GPU
+# pods (CUDA-12.8 driver) install the matching wheel manually instead, then run with --no-sync:
+#   uv pip install torch --reinstall --index-url https://download.pytorch.org/whl/cu128
+#   uv run --no-sync --package training python -m training.sft.train ...
+# (Default PyPI torch targets CUDA 13 and won't init on a 12.8 driver, hence the manual cu128 wheel.)
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
