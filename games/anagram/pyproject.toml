@@ -1,0 +1,24 @@
+[project]
+name = "game-anagram"
+version = "0.1.0"
+description = "Anagrams — a single-turn reasoning word-skill FastAPI game server"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.27.0",        # HTTPAnagramClient transport
+    "game-wordvocab",        # committed multi-length vocab.txt + salted split
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+game-wordvocab = { workspace = true }
+
+[tool.uv]
+# Flat-layout namespace modules imported via the workspace `pythonpath`, not built as a wheel.
+package = false

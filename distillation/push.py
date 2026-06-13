@@ -30,6 +30,17 @@ DEFAULT_INPUTS = [
     "distillation/data/batch_low_sft.jsonl",
     "distillation/data/batch_high_sft.jsonl",
     "distillation/data/charcount_sft.jsonl",
+    "distillation/data/validity_sft.jsonl",
+    "distillation/data/anagram_sft.jsonl",
+    "distillation/data/rhyme_sft.jsonl",
+    "distillation/data/crossword_sft.jsonl",
+    "distillation/data/charset_sft.jsonl",
+    "distillation/data/mistakeid_sft.jsonl",
+    "distillation/data/tower_sft.jsonl",
+    "distillation/data/endstart_sft.jsonl",
+    "distillation/data/codebreaker_sft.jsonl",
+    "distillation/data/bullscows_sft.jsonl",
+    "distillation/data/consistency_sft.jsonl",
 ]
 
 # Map a file stem to its game, so legacy rows (game = episode index) can be normalized. New
@@ -39,6 +50,17 @@ _STEM_GAME = {
     "batch_high_sft": ("wordle", 0),
     "batch_sft": ("wordle", 0),
     "charcount_sft": ("charcount", 1),
+    "validity_sft": ("validity", 2),
+    "anagram_sft": ("anagram", 3),
+    "rhyme_sft": ("rhyme", 5),
+    "crossword_sft": ("crossword", 6),
+    "charset_sft": ("charset", 7),
+    "mistakeid_sft": ("mistakeid", 8),
+    "tower_sft": ("tower", 9),
+    "endstart_sft": ("endstart", 4),
+    "codebreaker_sft": ("codebreaker", 10),
+    "bullscows_sft": ("bullscows", 11),
+    "consistency_sft": ("consistency", 12),
 }
 
 
@@ -46,11 +68,20 @@ def load_rows(paths: list[str]) -> list[dict]:
     """Read every JSONL line, normalize to the unified schema, and tag with `source` (file stem)."""
     rows: list[dict] = []
     for p in paths:
+        if not Path(p).exists():
+            print(f"  skipping missing input: {p}")
+            continue
         stem = Path(p).stem
         game_name, game_no = _STEM_GAME.get(stem, ("unknown", -1))
         for line in Path(p).read_text().splitlines():
             if line.strip():
                 row = normalize_legacy(json.loads(line), game_name=game_name, game_no=game_no)
+                # Wordle quality gate is FORMAT compliance, not winning: a well-formed move (one
+                # that reasoned in a <think> block) is a good SFT target even from a lost game, and
+                # a move with no <think> is dropped regardless of the outcome. So re-derive Wordle's
+                # `valid` from has_think rather than the won-based flag the rollouts wrote.
+                if row.get("game_name") == "wordle":
+                    row["valid"] = bool(row.get("has_think"))
                 row["source"] = stem
                 rows.append(row)
     return rows

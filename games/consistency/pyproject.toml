@@ -1,0 +1,23 @@
+[project]
+name = "game-consistency"
+version = "0.1.0"
+description = "Candidate-consistency — a single-turn Wordle clue-filtering FastAPI game server"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.27.0",
+    "game-wordle",           # reuse compute_feedback + WordBank (the 5-letter vocabulary)
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+game-wordle = { workspace = true }
+
+[tool.uv]
+package = false

@@ -209,8 +209,11 @@ def main(argv: list[str] | None = None) -> None:
     game_no = GAME_NUMBERS.get(args.game, -1)
     with out_sft.open("w") as f:
         for i, g in enumerate(games):
-            valid = g["status"] == spec.good_status  # solved-episode gate → the `valid` flag
+            solved = g["status"] == spec.good_status  # solved-episode gate → the `valid` flag
             for t in g["turns"]:
+                # Reasoning games require a <think> block: a solved-but-unthought trace is
+                # unusable as an SFT target, so it fails the gate like a wrong answer.
+                valid = solved and (not spec.require_think or "<think>" in t["output"])
                 row = sft_row(
                     game_name=args.game, game_no=game_no, round=t["round"], target=g["target"],
                     system=agent.system_prompt,

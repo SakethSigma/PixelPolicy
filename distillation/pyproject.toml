@@ -12,12 +12,34 @@ dependencies = [
     "agents",                   # run_eval, Trajectory, AnthropicBackend, the per-game agents
     "game-wordle",              # WordBank / LocalWordleClient for the Wordle rollouts
     "game-charcount",           # charcount bank/client for the programmatic generator
+    "game-validity",            # validity bank/client for the programmatic generator
+    "game-anagram",             # anagram bank/client for the batch (Claude) generator
+    "game-rhyme",               # rhyme bank/client for the programmatic generator
+    "game-crossword",           # crossword bank/client for the batch (Claude) generator
+    "game-charset",             # charset bank/client for the programmatic generator
+    "game-mistakeid",           # mistakeid bank/client for the batch (Claude) generator
+    "game-tower",               # tower bank/client for the programmatic generator
+    "game-endstart",            # endstart bank/client for the programmatic generator
+    "game-codebreaker",         # codebreaker bank/client/solver for the multi-turn generator
+    "game-bullscows",           # bullscows bank/client/solver for the multi-turn generator
+    "game-consistency",         # consistency bank/client for the programmatic generator
 ]
 
 [tool.uv.sources]
 agents = { workspace = true }
 game-wordle = { workspace = true }
 game-charcount = { workspace = true }
+game-validity = { workspace = true }
+game-anagram = { workspace = true }
+game-rhyme = { workspace = true }
+game-crossword = { workspace = true }
+game-charset = { workspace = true }
+game-mistakeid = { workspace = true }
+game-tower = { workspace = true }
+game-endstart = { workspace = true }
+game-codebreaker = { workspace = true }
+game-bullscows = { workspace = true }
+game-consistency = { workspace = true }
 
 [tool.uv]
 # Flat-layout namespace package imported via the workspace `pythonpath`, not built as a

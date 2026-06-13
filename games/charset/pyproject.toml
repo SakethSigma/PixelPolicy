@@ -1,0 +1,26 @@
+[project]
+name = "game-charset"
+version = "0.1.0"
+description = "Used/unused character set — a single-turn word-skill FastAPI game server"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.27.0",        # HTTPCharsetClient transport
+    "game-wordvocab",        # committed multi-length vocab.txt + salted split
+    "game-wordle",           # the five-letter half of each challenge is a Wordle word
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+game-wordvocab = { workspace = true }
+game-wordle = { workspace = true }
+
+[tool.uv]
+# Flat-layout namespace modules imported via the workspace `pythonpath`, not built as a wheel.
+package = false

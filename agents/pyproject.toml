@@ -9,6 +9,17 @@ dependencies = [
     "pydantic>=2.0.0",
     "game-wordle",          # reuse render_observation / WordleClient / render_board
     "game-charcount",       # charcount agent reuses its render_observation
+    "game-validity",        # validity agent reuses its render_observation
+    "game-anagram",         # anagram agent reuses its render_observation
+    "game-rhyme",           # rhyme agent reuses its render_observation
+    "game-crossword",       # crossword agent reuses its render_observation
+    "game-charset",         # charset agent reuses its render_observation
+    "game-mistakeid",       # mistakeid agent reuses its render_observation
+    "game-tower",           # tower agent reuses its render_observation
+    "game-endstart",        # endstart agent reuses its render_observation
+    "game-codebreaker",     # codebreaker agent reuses its render
+    "game-bullscows",       # bullscows agent reuses its render
+    "game-consistency",     # consistency agent reuses its render_observation
 ]
 
 [project.optional-dependencies]
@@ -26,6 +37,17 @@ dev = [
 [tool.uv.sources]
 game-wordle = { workspace = true }
 game-charcount = { workspace = true }
+game-validity = { workspace = true }
+game-anagram = { workspace = true }
+game-rhyme = { workspace = true }
+game-crossword = { workspace = true }
+game-charset = { workspace = true }
+game-mistakeid = { workspace = true }
+game-tower = { workspace = true }
+game-endstart = { workspace = true }
+game-codebreaker = { workspace = true }
+game-bullscows = { workspace = true }
+game-consistency = { workspace = true }
 
 [tool.uv]
 # Flat-layout namespace package imported via the workspace `pythonpath`, not built as a
