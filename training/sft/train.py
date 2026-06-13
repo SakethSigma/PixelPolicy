@@ -183,7 +183,9 @@ def main(argv: list[str] | None = None) -> None:
 
     output_dir = args.output_dir or f"./runs/{args.variant}"
     if args.report_to == "wandb":
-        os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+        # Force the project — a stray WANDB_PROJECT in the pod env (e.g. set to a HF repo id with a
+        # "/") makes wandb.init reject it. Our --wandb-project always wins.
+        os.environ["WANDB_PROJECT"] = args.wandb_project
 
     from transformers import AutoTokenizer
     from trl import SFTConfig, SFTTrainer
