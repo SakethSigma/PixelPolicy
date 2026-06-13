@@ -21,8 +21,12 @@ from training.sft.format import GAME_NO
 def _small_dataset(args, tokenizer, n: int):
     games = ["wordle"] if args.variant == "wordle" else None
     ds = load_flat(args.dataset_repo, split="train", games=games, tokenizer=tokenizer,
-                   seed=0, shuffle=True, num_proc=args.num_proc)
-    return ds.select(range(min(n, len(ds))))
+                   seed=0, shuffle=False, num_proc=args.num_proc)
+    # WORST CASE: take the LONGEST rows so the batch pads near max_seq_len — random short rows
+    # under-report peak memory (the cross-entropy logits scale with batch×seq×vocab).
+    ds = ds.map(lambda x: {"_len": len(x["prompt"]) + len(x["completion"])}, num_proc=args.num_proc)
+    ds = ds.sort("_len", reverse=True).select(range(min(n, len(ds))))
+    return ds.remove_columns("_len")
 
 
 def _run_once(SFTConfig, SFTTrainer, *, model_id, tokenizer, dataset, batch_size, args):

@@ -64,6 +64,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--gradient-checkpointing", action="store_true")
     ap.add_argument("--logging-steps", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=-1, help="override for smoke tests.")
+    ap.add_argument("--loss-type", default="chunked_nll",
+                    help="chunked_nll chunks the LM-head loss so the full fp32 logits "
+                         "(batch×seq×~248k vocab) never materialize — avoids the cross-entropy OOM.")
     # eval (coarse; loss is not the metric — downstream accuracy is)
     ap.add_argument("--eval-split", default="test")
     ap.add_argument("--eval-samples-per-game", type=int, default=200,
@@ -224,6 +227,7 @@ def main(argv: list[str] | None = None) -> None:
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         max_seq_length=args.max_seq_len,
+        loss_type=args.loss_type,            # chunked_nll → avoids the large-vocab cross-entropy OOM
         packing=False,                       # required: keep prompt-completion masking intact
         bf16=args.bf16,
         fp16=args.fp16,
