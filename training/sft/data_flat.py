@@ -63,14 +63,40 @@ def to_examples(ds, tokenizer, *, num_proc: int = 4):
     )
 
 
+def filter_max_tokens(ds, tokenizer, max_tokens: int, *, num_proc: int = 4):
+    """Drop rows whose tokenized prompt+completion exceeds `max_tokens`.
+
+    Filtering (vs truncating) keeps SFT targets intact — a truncated completion would teach a
+    cut-off answer. Operates on the formatted prompt/completion Dataset.
+    """
+    def _measure(batch):
+        joined = [p + c for p, c in zip(batch["prompt"], batch["completion"])]
+        ids = tokenizer(joined, add_special_tokens=False)["input_ids"]
+        return {"_ntok": [len(x) for x in ids]}
+
+    ds = ds.map(_measure, batched=True, num_proc=num_proc, desc="measure tokens")
+    before = len(ds)
+    ds = ds.filter(lambda r: r["_ntok"] <= max_tokens, num_proc=num_proc)
+    dropped = before - len(ds)
+    if dropped:
+        print(f"[filter] dropped {dropped}/{before} rows over {max_tokens} tokens")
+    return ds.remove_columns("_ntok")
+
+
 def load_flat(repo_id: str = DEFAULT_REPO, *, split: str = "train",
               games: list[str] | None = None, tokenizer, seed: int = 0,
-              shuffle: bool = True, num_proc: int = 4):
-    """Flat loader: valid-filter (+ optional game filter) → shuffle → prompt/completion Dataset."""
+              shuffle: bool = True, num_proc: int = 4, max_tokens: int | None = None):
+    """Flat loader: valid-filter (+ optional game filter) → shuffle → prompt/completion Dataset.
+
+    If `max_tokens` is set, rows whose prompt+completion exceeds it are dropped (not truncated).
+    """
     ds = load_valid(repo_id, split=split, games=games)
     if shuffle:
         ds = ds.shuffle(seed=seed)
-    return to_examples(ds, tokenizer, num_proc=num_proc)
+    ds = to_examples(ds, tokenizer, num_proc=num_proc)
+    if max_tokens is not None:
+        ds = filter_max_tokens(ds, tokenizer, max_tokens, num_proc=num_proc)
+    return ds
 
 
 # --------------------------------------------------------------------------------------------

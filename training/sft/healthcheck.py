@@ -48,6 +48,7 @@ def _run_once(SFTConfig, SFTTrainer, *, model_id, tokenizer, dataset, batch_size
         gradient_accumulation_steps=1,
         learning_rate=args.lr,
         max_seq_length=args.max_seq_len,
+        loss_type=args.loss_type,            # match training (chunked_nll) so the sweep is representative
         packing=False,
         bf16=args.bf16,
         fp16=args.fp16,
@@ -79,6 +80,8 @@ def _main() -> None:
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--max-seq-len", type=int, default=4096)
+    ap.add_argument("--loss-type", default="chunked_nll",
+                    help="must match training; chunked_nll avoids the large-vocab cross-entropy OOM.")
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--gradient-checkpointing", action="store_true")
@@ -103,8 +106,10 @@ def _main() -> None:
     tok.padding_side = "right"
     ds = _small_dataset(args, tok, args.rows)
     assert {"prompt", "completion"} <= set(ds.column_names), "loader must yield prompt/completion"
-    print(f"[healthcheck] data OK: {len(ds)} rows; columns={ds.column_names}")
-    print(f"[healthcheck] example prompt[:200]={ds[0]['prompt'][:200]!r}")
+    longest = max(len(tok(ds[i]["prompt"] + ds[i]["completion"], add_special_tokens=False)["input_ids"])
+                  for i in range(min(len(ds), 64)))
+    print(f"[healthcheck] data OK: {len(ds)} rows (LONGEST sequences, worst case for memory); "
+          f"max prompt+completion ≈ {longest} tokens; loss_type={args.loss_type}")
 
     sizes = [int(x) for x in args.sweep.split(",")] if args.sweep else [4]
 

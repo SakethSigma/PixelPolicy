@@ -29,7 +29,9 @@ import argparse
 import random
 
 from training.sft.format import GAME_NO, REASONING_GAMES, STAGE, build_example
-from training.sft.data_flat import DEFAULT_MODEL, DEFAULT_REPO, load_valid, summarize, to_examples
+from training.sft.data_flat import (
+    DEFAULT_MODEL, DEFAULT_REPO, filter_max_tokens, load_valid, summarize, to_examples,
+)
 
 # Strategies whose row ORDER is meaningful → train with a SequentialSampler (no reshuffle).
 ORDERED_STRATEGIES = frozenset({"widening", "sorted"})
@@ -102,13 +104,22 @@ def _order_indices(raw, strategy: str, *, reasoning_throughout: bool = True,
 def load_curriculum(repo_id: str = DEFAULT_REPO, *, split: str = "train",
                     games: list[str] | None = None, tokenizer, strategy: str = "widening",
                     reasoning_throughout: bool = True, replay_frac: float = 0.03,
-                    num_proc: int = 4, seed: int = 0):
-    """Load the full valid set and return a prompt/completion Dataset in curriculum order."""
+                    num_proc: int = 4, seed: int = 0, max_tokens: int | None = None):
+    """Load the full valid set and return a prompt/completion Dataset in curriculum order.
+
+    If `max_tokens` is set, over-length rows are dropped (after ordering, so the curriculum order is
+    preserved). NOTE: filtering scrambles the contiguous order slightly only by removal, not reorder.
+    """
     raw = load_valid(repo_id, split=split, games=games)
     order = _order_indices(raw, strategy, reasoning_throughout=reasoning_throughout,
                            replay_frac=replay_frac, seed=seed)
     ordered = raw.select(order)
-    return to_examples(ordered, tokenizer, num_proc=num_proc)
+    ds = to_examples(ordered, tokenizer, num_proc=num_proc)
+    if max_tokens is not None:
+        # keep_order: filter preserves row order, so the curriculum ordering survives (rows removed,
+        # never reordered).
+        ds = filter_max_tokens(ds, tokenizer, max_tokens, num_proc=num_proc)
+    return ds
 
 
 def _order_profile(raw, order: list[int], *, n_buckets: int = 10) -> None:

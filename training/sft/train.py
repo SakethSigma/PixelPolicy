@@ -97,14 +97,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def build_train_dataset(args, tokenizer):
     if args.variant == "wordle":
         return load_flat(args.dataset_repo, split="train", games=["wordle"], tokenizer=tokenizer,
-                         seed=args.seed, shuffle=True, num_proc=args.num_proc)
+                         seed=args.seed, shuffle=True, num_proc=args.num_proc,
+                         max_tokens=args.max_seq_len)
     if args.variant == "full":
         return load_flat(args.dataset_repo, split="train", games=None, tokenizer=tokenizer,
-                         seed=args.seed, shuffle=True, num_proc=args.num_proc)
+                         seed=args.seed, shuffle=True, num_proc=args.num_proc,
+                         max_tokens=args.max_seq_len)
     return load_curriculum(args.dataset_repo, split="train", games=None, tokenizer=tokenizer,
                            strategy=args.curriculum_strategy,
                            reasoning_throughout=not args.no_reasoning_throughout,
-                           replay_frac=args.replay_frac, seed=args.seed, num_proc=args.num_proc)
+                           replay_frac=args.replay_frac, seed=args.seed, num_proc=args.num_proc,
+                           max_tokens=args.max_seq_len)
 
 
 def build_eval_datasets(args, tokenizer):
@@ -116,7 +119,8 @@ def build_eval_datasets(args, tokenizer):
         if cap <= 0:
             return None
         ds = load_flat(args.dataset_repo, split=args.eval_split, games=g, tokenizer=tokenizer,
-                       seed=args.seed, shuffle=True, num_proc=args.num_proc)
+                       seed=args.seed, shuffle=True, num_proc=args.num_proc,
+                       max_tokens=args.max_seq_len)
         return ds.select(range(min(cap, len(ds)))) if len(ds) else None
 
     agg = _subsample(games, args.eval_samples_all)
