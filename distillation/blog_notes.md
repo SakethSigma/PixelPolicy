@@ -520,9 +520,50 @@ limit: a block moving less is **not** evidence it's under-trained — move size 
 whether a move helped (only loss/eval can), and the gap here is only ~10%, not a starvation.
 
 ### What would sharpen this next
-- A run that logs **attention and MLP movement separately** (not done yet): every block's MLP is
-  identical and only the attention differs, so the prediction is the ripple should **vanish in the MLP
-  view and sharpen in the attention view** — a clean confirmation the bands are the attention seam.
+- A run that logs **attention and MLP movement separately** — **now built** (`attn_NN`/`mlp_NN`/
+  `norm_NN` per block, plus the whole-block `layer_NN` kept comparable to the wordle run): MLP is
+  identical across blocks and only attention differs, so the prediction is the 4-layer ripple should
+  **vanish in the MLP view and sharpen in the attention view** — a clean confirmation the bands are the
+  attention seam. (Lands with the `full-v2` run.)
+- A **per-game gradient probe** — also built. The training-batch gradient *mixes* games (mean over the
+  batch), so it can't be attributed per-game; instead we periodically run each game's held-out batch
+  through fwd+bwd *in isolation* and record its per-layer grad signature → `grad_probe.jsonl`. This
+  asks the question we actually care about: **do simple lookup games drive early layers and reasoning
+  games drive later ones?** Caveat to state honestly: it's the *gradient in isolation* (ignores
+  cross-game interference) and not the Adam *update*.
 - The **`curriculum`** run, for the order/forgetting comparison it was built for.
 - These norms are *absolute* move size, not move *relative to* a block's existing weights — a relative
   view would be a useful addition.
+
+---
+
+# Part IV — Two methodology lessons + the infra tax
+
+## "Infer once, recompute forever" (store raw predictions)
+The first eval harness computed metrics and **threw away the model's generations** — so wanting one
+new metric meant re-running hours of inference. Fix: persist every episode's raw record (target,
+outcome, each turn's reply + parsed action) **incrementally** to `eval_results/raw/<label>/<game>.jsonl`
+as it finishes; a separate `recompute.py` rebuilds any metric from that with **zero** inference. The
+expensive part (generation) is paid once; metrics are a cheap, re-runnable transform. Same "raw is the
+source of truth" principle the distillation pipeline already used — we just hadn't applied it to eval.
+
+## The eval almost lied because of a token cap
+Wordle win-rate looked low until we noticed `action_parse_rate ≈ 0.86` — **~14% of thinking turns ran
+out of generation budget mid-`<think>` and never emitted a `<guess>`.** The cap was `max_tokens=2048`
+(the *generation* budget, distinct from training's 4096 *sequence* length). Bumped to 4096 → the model
+stops getting cut off, and a truncated turn = a wasted Wordle round. Lesson: before reading a
+behavioral number, check the **format/parse rate** — a "bad at the task" score is often "got
+truncated." (Related: eval loss *rose* at epoch 4 while win-rate held/climbed — token-CE-vs-teacher
+overfits while the actual skill generalizes. Loss is not the scorecard.)
+
+## The infra tax (the unglamorous days)
+More wall-clock went to plumbing than to ML. Worth its own section because everyone pays it:
+- **Ephemeral vs persistent storage.** Checkpoints written to the pod's **container disk** were
+  **lost** when a GPU went unavailable and migration failed. The fix is boring and total: write to a
+  **persistent network volume** (`/workspace`), and treat the container disk as scratch.
+- **The only way off a no-git pod is the Hub.** So we push everything there: epoch weights (for
+  inference), a `resume` full checkpoint with optimizer state (crash recovery — the per-epoch
+  weights-only push can't resume training), and even the analysis `grad_probe.jsonl`.
+- **torch vs. the host driver** (CUDA-13 wheel on a CUDA-12.8 box), **sessions dying on disconnect**
+  (use `tmux`; the job survives, the *view* doesn't). None of it is research — all of it stops the
+  research cold until fixed. Budget for it.
