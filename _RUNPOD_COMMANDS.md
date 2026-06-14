@@ -152,4 +152,17 @@ auto-finds the latest local checkpoint.)
 - **Tracking:** wandb project `pixelpolicy-sft`; per-layer `gradnorm/*` + `updnorm/*` panels now also
   split per block into `attn_NN` / `mlp_NN` / `norm_NN` (plus the whole-block `layer_NN`).
 - **Push everything first:** `git log origin/main..main` should be empty after Step 0.
+- **Getting `grad_probe.jsonl` (or any `/workspace` artifact) off the pod — no git there, use HF:**
+  ```bash
+  # on the pod — upload the probe JSONL to a branch of the model repo:
+  huggingface-cli upload saketh-chervu/word-games-sft-full-v2 \
+    /workspace/runs/full-v2/grad_probe.jsonl grad_probe.jsonl --revision probe
+  # on LOCAL — pull it down for analysis:
+  huggingface-cli download saketh-chervu/word-games-sft-full-v2 --revision probe \
+    --include grad_probe.jsonl --local-dir ./probe
+  ```
+  > **TODO (automate this):** the probe JSONL currently has to be uploaded by hand. Make it
+  > automatic — either push `grad_probe.jsonl` to HF each epoch (alongside the `resume` checkpoint in
+  > `EpochHubPushCallback`), or log it as a **wandb artifact** so it syncs to the cloud and downloads
+  > locally with the run. Until then, run the manual `huggingface-cli upload` above before killing the pod.
 ```
