@@ -52,14 +52,22 @@ def _epoch_callback_base():
     from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
     class EpochHubPushCallback(TrainerCallback):
-        """On each checkpoint save, push it to Hub revision `epoch-N`."""
+        """On each checkpoint save, push to Hub:
+
+        1. `epoch-N` — **weights-only** (clean, small; what inference pulls), and
+        2. `resume`  — the **FULL** checkpoint incl. optimizer/scheduler/RNG/trainer_state,
+           OVERWRITTEN each epoch. This is the crash-recovery copy: if the box dies, download
+           `revision=resume` and `train(resume_from_checkpoint=…)` continues from the last epoch
+           with the optimizer state intact. (Set `push_resume=False` to skip the heavier upload.)
+        """
 
         def __init__(self, *, hub_model_id: str, output_dir: str, private: bool = True,
-                     weights_only: bool = True):
+                     weights_only: bool = True, push_resume: bool = True):
             self.hub_model_id = hub_model_id
             self.output_dir = output_dir
             self.private = private
             self.weights_only = weights_only
+            self.push_resume = push_resume
 
         def on_save(self, args, state, control, **kwargs):
             ckpt = os.path.join(self.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
@@ -67,6 +75,9 @@ def _epoch_callback_base():
             if os.path.isdir(ckpt):
                 push_checkpoint(ckpt, self.hub_model_id, revision=f"epoch-{epoch}",
                                 private=self.private, weights_only=self.weights_only)
+                if self.push_resume:                       # full checkpoint → recoverable from HF
+                    push_checkpoint(ckpt, self.hub_model_id, revision="resume",
+                                    private=self.private, weights_only=False)
             return control
 
     return EpochHubPushCallback

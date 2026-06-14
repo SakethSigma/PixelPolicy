@@ -64,6 +64,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--gradient-checkpointing", action="store_true")
     ap.add_argument("--logging-steps", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=-1, help="override for smoke tests.")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from the LATEST local checkpoint in --output-dir (restores "
+                         "optimizer/scheduler/step/epoch). Use after a crash.")
+    ap.add_argument("--resume-from", default=None,
+                    help="resume from a specific checkpoint dir (e.g. ./runs/full/checkpoint-1234).")
     ap.add_argument("--loss-type", default="chunked_nll",
                     help="chunked_nll chunks the LM-head loss so the full fp32 logits "
                          "(batch×seq×~248k vocab) never materialize — avoids the cross-entropy OOM.")
@@ -86,6 +91,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--hub-model-id", default=None)
     ap.add_argument("--hub-per-epoch", action="store_true",
                     help="push each epoch checkpoint to its own Hub revision epoch-N.")
+    ap.add_argument("--no-hub-resume", action="store_true",
+                    help="skip pushing the FULL checkpoint (optimizer) to the 'resume' branch. By "
+                         "default a full crash-recoverable checkpoint is pushed each epoch.")
     ap.add_argument("--hub-private", action="store_true", default=True)
     return ap.parse_args(argv)
 
@@ -251,7 +259,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.push_to_hub and args.hub_per_epoch:
         from training.sft.upload import EpochHubPushCallback
         callbacks.append(EpochHubPushCallback(
-            hub_model_id=args.hub_model_id, output_dir=output_dir, private=args.hub_private))
+            hub_model_id=args.hub_model_id, output_dir=output_dir, private=args.hub_private,
+            push_resume=not args.no_hub_resume))
     if args.gradlog_steps > 0 and args.report_to == "wandb":
         from training.sft.dynamics import GradUpdateNormCallback
         callbacks.append(GradUpdateNormCallback(every=args.gradlog_steps))
@@ -265,7 +274,12 @@ def main(argv: list[str] | None = None) -> None:
     trainer = _make_trainer(trainer_cls, model=args.model, args_cfg=cfg,
                             train_dataset=train_dataset, eval_dataset=eval_dataset,
                             tokenizer=tokenizer, callbacks=callbacks)
-    trainer.train()
+    # Resume from a local full checkpoint (restores model + optimizer + scheduler + step + epoch).
+    #   --resume-from <dir>  exact checkpoint; --resume  auto-pick the latest in output_dir.
+    resume = args.resume_from or (True if args.resume else None)
+    if resume:
+        print(f"[train] resuming from {'(latest in output_dir)' if resume is True else resume}")
+    trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(output_dir)
 
     # Push the final weights to the repo's main revision too (per-epoch branches handled by callback).

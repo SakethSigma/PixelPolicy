@@ -28,16 +28,19 @@ def _build_callback():
 
     def _buckets(name: str) -> list[str]:
         """Buckets a param contributes to. Per transformer block we log the WHOLE block
-        (`layer_NN`) AND its attention (`attn_NN`) / MLP (`mlp_NN`) sub-norms separately, so the
-        viz can split attention vs feed-forward. (Layernorm params count toward `layer_NN` only.)"""
+        (`layer_NN`) AND each component separately: attention (`attn_NN`), MLP (`mlp_NN`), and the
+        remaining per-block params — the layernorms (`norm_NN`). `layer_NN` == attn+mlp+norm summed,
+        and is kept identical to the wordle run's logging so the two stay comparable."""
         m = _LAYER_RE.search(name)
         if m:
             nn = f"{int(m.group(1)):02d}"
-            out = [f"layer_{nn}"]
+            out = [f"layer_{nn}"]                      # whole block (comparable to wordle)
             if "self_attn" in name:
-                out.append(f"attn_{nn}")
+                out.append(f"attn_{nn}")               # q/k/v/o (+ q_norm/k_norm)
             elif "mlp" in name:
-                out.append(f"mlp_{nn}")
+                out.append(f"mlp_{nn}")                # gate/up/down
+            else:
+                out.append(f"norm_{nn}")               # input_layernorm / post_attention_layernorm
             return out
         if "embed" in name:
             return ["embed"]

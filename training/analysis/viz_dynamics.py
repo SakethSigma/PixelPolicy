@@ -189,8 +189,9 @@ def main() -> None:
     ap.add_argument("--runs", nargs="*", default=None,
                     help="run display names (default: all runs in the project).")
     ap.add_argument("--metric", choices=["updnorm", "gradnorm"], default="updnorm")
-    ap.add_argument("--component", choices=["layer", "attn", "mlp"], default="layer",
-                    help="layer = whole block; attn = self-attention only; mlp = feed-forward only.")
+    ap.add_argument("--component", choices=["layer", "attn", "mlp", "norm"], default="layer",
+                    help="layer = whole block; attn = self-attention; mlp = feed-forward; "
+                         "norm = per-block layernorms.")
     ap.add_argument("--normalize", action="store_true",
                     help="per-step column-normalize the heatmap (show relative layer distribution).")
     ap.add_argument("--out", default="./dynamics_plots")
