@@ -142,6 +142,44 @@ auto-finds the latest local checkpoint.)
 
 ---
 
+## Evaluating on a remote GPU (A100) — faster, + push results back to local
+
+A 0.8B model is tiny on an A100 80 GB, so the 12 GB-local `--concurrency 4` bottleneck is gone —
+run `--concurrency 32` (≈8× the in-flight episodes → ~hour, not many hours). Split work across
+machines (e.g. e1/e2 local, **e3/e4 remote**); each checkpoint is an independent `<label>.json` +
+`raw/<label>/`, so you just merge the dirs locally.
+
+**On the A100 pod** (same one-time setup as above: tmux, uv, clone, cu128 torch, `--no-sync`,
+`export HF_TOKEN=…`; the eval needs the inference deps):
+```bash
+cd /PixelPolicy
+uv sync --package inference     # agents + distillation + vllm for the eval harness
+uv pip install torch --reinstall --index-url https://download.pytorch.org/whl/cu128
+
+# run e3,e4 on all games — write to the PERSISTENT volume:
+uv run --no-sync --package inference python -m inference.run_checkpoints \
+  --repo saketh-chervu/word-games-sft-wordle --epochs 3,4 \
+  --games all --n 300 --seed 0 --enforce-eager --concurrency 32 \
+  --out /workspace/eval_results_v2/
+
+# push the whole eval dir (metrics + raw/) to a branch of the model repo:
+huggingface-cli upload saketh-chervu/word-games-sft-wordle \
+  /workspace/eval_results_v2 eval_results_v2 --revision eval --repo-type model
+```
+
+**On LOCAL — fetch the remote results and merge with your local ones:**
+```bash
+huggingface-cli download saketh-chervu/word-games-sft-wordle --revision eval \
+  --include "eval_results_v2/**" --repo-type model --local-dir ./fetched
+cp -rn ./fetched/eval_results_v2/* ./eval_results_v2/   # merge e3/e4 into the local e1/e2 dir
+uv run --no-project inference/analysis/viz_eval.py --results eval_results_v2 --out eval_plots_v2
+```
+Resumable + crash-tolerant: re-run the same `run_checkpoints` command and it skips completed episodes
+(resume-from-raw). (TODO if you want zero manual steps: add a `--push-results-repo` flag so the
+orchestrator uploads `eval_results_v2/` to HF after each checkpoint — say the word.)
+
+---
+
 ## Notes
 
 - **`--no-sync` on EVERY `uv run`** — non-negotiable; install torch once (step 3), never let uv touch it.
