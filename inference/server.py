@@ -33,14 +33,12 @@ DEFAULT_PORT = os.environ.get("INFERENCE_PORT", "8000")
 # Conservative defaults so the box-standard launch fits a 12 GB card. Each is applied only
 # when the user didn't already pass it, so explicit flags always win.
 #   --limit-mm-per-prompt  skips multimodal cache allocation for our text-only use of the VLM.
-#   --attention-backend    TRITON_ATTN needs no CUDA toolkit (Triton ships its own compiler),
-#                          unlike FlashInfer (needs nvcc) or FLASH_ATTN (not installed here).
-#                          TORCH_SDPA is ViT-only in vLLM v1, so it can't serve the LM.
+# (Attention backend is set via the VLLM_ATTENTION_BACKEND *env var* below — NOT a `--attention-backend`
+#  CLI flag, which only exists in newer vLLM; the env var works across versions, incl. 0.10.x.)
 SAFE_DEFAULTS: dict[str, str] = {
     "--max-model-len": "8192",
     "--gpu-memory-utilization": "0.85",
     "--limit-mm-per-prompt": '{"image":0,"video":0}',
-    "--attention-backend": "TRITON_ATTN",
 }
 
 
@@ -69,6 +67,11 @@ def main(argv: list[str] | None = None) -> None:
     # `--attention-backend TRITON_ATTN` SAFE_DEFAULT above (a CLI flag in vLLM 0.22, not an
     # env var). `setdefault` lets you override the sampler choice via the environment.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
+    # Attention backend via env var (portable across vLLM versions; the `--attention-backend` CLI
+    # flag only exists in newer vLLM). TRITON_ATTN ships with PyTorch (no nvcc) → works on WSL and
+    # on a real CUDA box alike. Override by exporting VLLM_ATTENTION_BACKEND yourself.
+    os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
 
     # Force vLLM's v1 model runner. The v2 runner (default-on for plain CausalLM archs like
     # Qwen3ForCausalLM) allocates UVA buffers, which require pinned host memory — and WSL
