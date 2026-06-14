@@ -259,3 +259,270 @@ cost a few dollars of Claude (three reasoning games) plus **$0** for everything 
 including the two new multi-turn deduction games (codebreaker, bullscows) and the
 endstart/consistency clue games. Adding the next game is still *one registry entry + one small
 package*, the same generate → capture → combine → push flow.
+
+---
+
+# Part III — Training the student, and evaluating the checkpoints
+
+## Three recipes, one harness
+
+With the dataset built, the question is *how* to feed it to the 0.8B student. We don't want to guess
+— we want to **compare**, so the trainer (HuggingFace TRL `SFTTrainer`) runs the exact same way for
+three recipes that differ only in *which rows, in what order*:
+
+1. **wordle-only** — train on just the 2,602 valid Wordle moves. The baseline: how far does
+   single-game imitation get you, and what does it cost on everything else?
+2. **full, shuffled** — all ~95.5k valid rows, standard random order. The "just throw the curriculum
+   at it" control.
+3. **full, curriculum** — all rows, but introduced **easy→hard** (see below).
+
+Every recipe trains **4 epochs** and pushes **each epoch's checkpoint to the Hub as its own
+revision** (`epoch-1..4`). That's deliberate: the training box is ephemeral (rented GPU, no git), so
+the Hub is the *only* output channel, and keeping every epoch lets us watch the model **over training
+time**, not just at the end. We train on the completion only (the prompt is masked) so the loss is
+about *what the model should say*, never the prompt we already fed it — byte-identical to inference.
+
+## The curriculum bet (and the forgetting worry)
+
+The interesting recipe is #3. The naïve version — sort everything strictly easy→hard and feed it
+once — is exactly the version the literature warns against. Across 4 epochs a *fixed* easy→hard order
+re-floods the model with trivial single-turn data at the **start of every epoch**, right after it
+last saw the hard reasoning data. Small models are the worst case for this: multi-task interference
+and reasoning fragility both peak below ~1B params, and only ~5.5% of our data carries real
+chain-of-thought, so the `<think>` skill is easy to drown.
+
+So our curriculum is **competence-*widening*, not blocked**: harder games become *eligible*
+progressively, but once introduced a game stays in the shuffled mix; the four reasoning games are
+kept present **throughout** (a "reasoning floor"); and a small **replay** slice of easy+reasoning data
+is spliced into the tail. The hypothesis we're actually testing: *strict* easy→hard is the arm most
+likely to erode reasoning, plain shuffle is a strong baseline, and the widening+replay variant is the
+one with a real chance of beating shuffle without forgetting. (Full design, hypotheses, and citations
+in `training/CURRICULUM_NOTES.md`.)
+
+## The tooling tax (lessons we paid for, again)
+
+Most of the friction wasn't the ML — it was the plumbing. Worth a paragraph because everyone hits it:
+
+- **Large vocab → cross-entropy OOM.** Qwen3.5 has a ~248k-token vocabulary, so the loss logits are
+  `batch × seq × 248k` in fp32 — ~15 GB *just for the loss* at batch 16, which OOM'd a 48 GB card
+  before training even started. The fix is **chunked cross-entropy** (`loss_type="chunked_nll"`):
+  identical math, computed in chunks so the full logits never materialize. (TRL is making it the
+  default — heed the deprecation warning.) Lesson: with a big-vocab model, the *loss*, not the
+  weights, is your memory wall.
+- **torch vs. the driver.** The default PyPI torch now targets CUDA 13, which won't initialize on the
+  CUDA-12.8 drivers cloud GPU hosts ship ("driver too old"). Pinning torch via an index in
+  `pyproject` quietly broke the bundled CUDA libs (`libcudnn.so.9` missing). What actually worked:
+  install the matching `cu128` wheel manually and stop the package manager from re-resolving it.
+  Lesson: pin the *wheel*, verify `torch.cuda.is_available()` before anything else, and don't trust a
+  green install.
+- **Cross-machine tracking.** Runs land on different rented boxes, so metrics go to **wandb** (cloud,
+  one project) rather than local files — you compare `wordle` / `full` / `curriculum` side by side
+  regardless of which machine produced them.
+
+## A peek at *where* it learns
+
+A cheap aside that pays off in intuition: a training callback logs the **per-layer gradient and
+update norms** (and, per block, attention vs. MLP) to wandb every N steps. Pulled back and drawn as a
+**layer × step heatmap**, it shows *where* in the 24-layer stack the optimizer is actually moving
+weight, and how that front shifts across epochs and recipes. Early read (noisy, one run): the lower
+layers barely move while the **middle/upper-middle** blocks do most of the adapting — consistent with
+"lower layers are general/done from pretraining, task-specific work happens higher." We treat this as
+intuition-building, not a result. (See `training/LEARNING_DYNAMICS_NOTES.md`.)
+
+## Evaluating the checkpoints — the metric that matters
+
+Training loss is **not** the scorecard. What we care about is whether the model can *play*. So each
+checkpoint is evaluated **behaviorally**: host it locally (vLLM) and have it actually play a fixed,
+seeded held-out test set of **all 13 games** — 300 instances each, the *same* instances for every
+checkpoint, frozen sampling (`temp 0.6`, thinking on). A game counts as solved when the env's own
+ground truth says so (`won` for the deduction games, `correct` for the single-turn ones), and we
+report accuracy / win-rate with a **Wilson 95% CI** so a 52%-vs-55% wiggle isn't over-read. The whole
+thing reuses the existing game registry — one generic loop drives all 13 games — and the base
+(untrained) model is evaluated too, as the reference line.
+
+The questions this is built to answer (results to drop in once the run completes):
+- Does the wordle-only model's **win rate climb** across its 4 epochs — and does it **overfit** (peak
+  then dip) by epoch 4?
+- **Transfer / interference:** a wordle-only SFT never saw the other 12 games — does playing Wordle
+  *help* or *hurt* the related word skills vs. the base model? (The base→best **delta-per-game** plot
+  is the headline here.)
+- Eventually, the three-way comparison: does **full** beat **wordle-only** on transfer, and does the
+  **curriculum** protect reasoning (the `<think>` games) better than plain shuffle — i.e. do the
+  forgetting hypotheses hold?
+
+*(Numbers + figures — the game×checkpoint heatmap, per-game curves, the Wordle win-rate-by-epoch, and
+the transfer delta — go here after the eval run.)*
+
+## Lessons worth keeping (Part III)
+- Keep **every epoch's checkpoint** (push to the Hub); "the model over training" is far more
+  informative than the final weights, and it costs nothing.
+- **Compare recipes, don't guess** — wordle-only / full / curriculum share one trainer so the only
+  variable is the data.
+- For a small model on a big-vocab base, the **loss** is the memory wall → chunked cross-entropy.
+- **Behavioral eval, fixed seeded test set, base as reference, CIs on everything** — loss curves lie
+  about whether the model can actually play.
+- Strict easy→hard curriculum is a *cautionary* arm, not the default — protect the fragile reasoning
+  skill (keep it interspersed + a little replay).
+
+---
+
+# Part III — Watching *where* the model learns (grad norm vs update norm)
+
+> Working notes for explaining the learning-dynamics plots to a general reader. Goal: make the two
+> numbers we log per layer (`gradnorm`, `updnorm`) understandable without jargon, then use them to
+> ask *where in the network* fine-tuning actually changes things.
+
+## The model is just a big pile of numbers, organized into floors
+
+A language model is ~800 million numbers called **weights**. Training does one thing, over and over:
+nudge each number a little so the next prediction is better. Those weights are stacked into **24
+layers** — think of them as 24 floors of a building. The input text enters at floor 0 (the bottom),
+gets processed floor by floor, and the answer comes out at floor 23 (the top). Each floor holds
+roughly the same number of weights.
+
+## One training step is two moves: the *push*, then the *actual move*
+
+**Move 1 — the push.** For every weight, the math computes one number: "to make the model better,
+change this weight by about *this much*, in *this direction*." That per-weight number is the
+**gradient**. It's a wish list — pure "what would help," with no decision yet about how far to go.
+
+**Move 2 — the actual move.** An optimizer (Adam) reads the wish list and decides how far to
+*really* nudge each weight, multiplying everything by a tiny **learning rate** (e.g. 0.00002). So the
+real moves are far smaller than the wishes, and Adam reshapes them too. Then the weights take their
+new values.
+
+So per weight there are two things worth watching: **the push it got** and **how far it actually
+moved** (new value minus old value).
+
+## "Norm" just means "the overall size of a bunch of numbers"
+
+A floor has millions of weights, so millions of push-numbers. We want **one** summary number per
+floor, not millions. That's the **norm**, and the recipe is mechanical:
+
+> square every number, add them all up, take the square root.
+
+Tiny example — pretend a floor had only 3 weights whose pushes were `0.02, 0.01, -0.03`:
+
+```
+norm = sqrt(0.02² + 0.01² + 0.03²) = sqrt(0.0014) = 0.037
+```
+
+That `0.037` is the floor's **gradnorm**: "the overall size of the push on this floor." Big = shoved
+hard; small = barely touched.
+
+## The two numbers we log
+
+- **`gradnorm` (the push / the *wish*)** — square-sum-sqrt over all of a floor's gradients. *How
+  hard the loss wanted to change this floor this step.* Crucially, it has **no learning rate in it** —
+  it's measured before the optimizer scales anything, so it's the pure learning *pressure*. (One
+  honest footnote: it's read just after gradient *clipping*, a safety cap on the total push, so it's
+  "the push that actually drives the step," minus only that cap.)
+- **`updnorm` (the actual move)** — square-sum-sqrt over how far each of a floor's weights *actually*
+  moved (new − old). *How much this floor really changed this step.* This one **does** include the
+  learning rate and everything Adam did.
+
+They differ because of Move 2. Continuing the example: pushes `0.02, 0.01, -0.03` give gradnorm
+`0.037`, but after Adam the weights only moved by `-0.001, -0.0008, 0.0015` → updnorm `0.002`. **Push
+0.037, actual move 0.002** — the move is tiny because the learning rate is tiny. **`updnorm` is the
+honest "did this part of the model change" signal; `gradnorm` is "how badly did it want to."**
+
+## The one trap: these numbers are not divided by anything
+
+The recipe adds **one term per weight**, so a part with *more* weights gets a bigger number
+automatically — even if each individual weight moved the same amount. Practical rules:
+
+- **Floor-to-floor is a *mostly* fair comparison.** The 24 floors have ~the same weight count, so a
+  higher number usually means that floor moved more — but with one caveat we hit below: every 4th
+  floor is a *different kind* of floor, so it's only an apples-to-apples comparison within a type.
+- **The word-lookup table (`embed`) is not comparable to a floor.** It has ~150 million numbers vs a
+  floor's few million, so its norm looks huge mostly because there's more to add up — *not* because
+  each weight there learns more. Only compare equal-sized things.
+
+## What the two views tell you
+
+- **Across floors** (lay floors 0→23 left to right): *which depth of the network is moving, and which
+  is sitting still.* A peak at floor 13 literally means floor 13's weights changed more than the
+  others'.
+- **Across time** (step 50, 100, 150…): *is the movement dying down as the model learns, and do
+  different floors move early vs. late?* A floor whose `updnorm` shrinks is settling; one that stays
+  high near the end is still being rewritten.
+
+**The payoff question:** the push and the actual move often peak at *different* floors. Raw push tends
+to pile up at the edges (the first floor near the input, the last floor near the answer), while the
+actual movement concentrates in the upper-middle floors. That gap — wanted-to-move vs. did-move — is
+the interesting story, and it's the whole reason we log both instead of just one.
+
+## What we actually saw (first runs)
+
+We log these two numbers every **50 optimizer steps** (not once per epoch) for all 24 blocks, plus the
+embedding and the final norm. So far we have two of three planned runs: **`wordle`** (one game,
+finished, small — only ~106 steps, so just 2 logged points) and **`full`** (all 13 games, still
+training, hundreds of steps). `curriculum` isn't logged yet. The wordle curve is a *hint* from 2
+points; `full` is where to trust a shape.
+
+### Finding 1 — fine-tuning barely touches the bottom of the network
+Reading the *actual move* (`updnorm`) across floors: the **input-side blocks (0–7) move least**,
+movement **rises through the middle, and the upper-middle blocks (~8–18) move most**, easing slightly
+at the very top. Plain reading: the lower floors already hold generic spelling/word machinery from
+pretraining that transfers to the word games unchanged, so the optimizer leaves them alone; the
+task-specific work (read ✓/–/x feedback, narrow candidates, emit the format) is composed in the
+upper-middle stack, so that's where the weights actually move. This shows in both runs — it's the
+headline.
+
+### Finding 2 — where the model *wants* to change ≠ where it *does* change
+The push (`gradnorm`) and the move (`updnorm`) peak at **different** floors. The push piles up at the
+two **edges** — block 0 (against the input) and especially block 23 (against the output/loss, where
+the error signal is most direct). The movement piles up in the **upper-middle**. The sharpest case:
+the **last block has the biggest push but nearly the smallest move** — it wants to change the most,
+and Adam moves it the least. Why: Adam divides each weight's step by a running estimate of that
+weight's own gradient size, so a big push gets normalized back down — a large gradient does *not* buy
+a proportionally large step. (A safety cap, gradient clipping, also pins the whole-model push to a
+fixed size each step, so per-block push is really a *share* of a fixed budget.) Lesson: for "where did
+the model actually change," read `updnorm`, not `gradnorm`.
+
+### Finding 3 — the moves collapse at the very end because of the schedule, not because Adam "gives up"
+In the `wordle` heatmap the final logged column goes dark — every block's move shrinks at once. Cause:
+the **cosine learning-rate schedule** ramps the learning rate to ~zero by the end, and since every
+move is multiplied by the learning rate, all moves shrink together. We can rule out the tempting "the
+gradients went noisy and cancelled out" story: the **push was still at full strength** there (still
+hitting the clipping cap), so the gradients hadn't weakened — only the step size applied to them had.
+(This just says moves vanish in the final handful of steps *by design*; expected, not a discovery.)
+
+### Finding 4 — the repeating 4-layer "bands" are the architecture, not learning
+The most eye-catching pattern is a ripple with period 4: every 4th block (indices **3, 7, 11, 15, 19,
+23**) moves a bit *less* than its neighbors, slicing the plot into bands. It's **real** (identical
+indices in both runs) but it's **not about the task or about depth** — it's the base model. **Qwen3.5-
+0.8B is a hybrid-attention model**: 3 of every 4 blocks use cheap **linear attention** (an
+RNN/state-space-style mixer with fixed memory), and every 4th block uses the original **full (softmax)
+attention** (all-pairs, exact recall, expensive). The config's `full_attention_interval: 4` puts full
+attention at exactly 3, 7, 11, … — the dip indices. (It's done to stay cheap at long context: linear
+attention is light, the periodic full-attention layers restore exact long-range recall.)
+
+The tell that it's an **optimizer effect, not a learning one**: the ripple is in `updnorm` (the move)
+but **absent in `gradnorm`** (the push) — if anything the full-attention blocks *push harder*. They
+want to move more, but Adam moves them less, because their different internals give them different
+gradient statistics and Adam's per-weight normalization reacts to that. Two different machines,
+measured with one ruler. **Consequence:** "this block moved more than that one" is only fair *within a
+block type*; in the figures we mark the every-4th (full-attention) layers so the bands aren't misread
+as a depth trend. The slow envelope (Finding 1) is the trustworthy depth signal; the 4-layer ripple
+riding on it is the architecture seam.
+
+**And that optimizer behavior is a feature, not a bug.** Note *where* the bands come from: the raw
+push (`gradnorm`) is smooth — no 4-layer pattern — so the periodicity is created entirely by Adam
+turning push into move. The reason it does this is the whole point of Adam: it divides each weight's
+step by a running estimate of that weight's own gradient size, which **equalizes progress across parts
+of the network that naturally have very different gradient scales.** Without it (plain SGD), the
+loudest-gradient layers — like the full-attention blocks, or the last block against the loss — would
+dominate every step and starve everything else; *that* would be skewed learning. So Adam taking
+smaller steps where gradients are larger/noisier isn't damage, it's calibrated caution, and it matters
+*more* for a hybrid model whose two block types have genuinely different gradient geometry. The honest
+limit: a block moving less is **not** evidence it's under-trained — move size says nothing about
+whether a move helped (only loss/eval can), and the gap here is only ~10%, not a starvation.
+
+### What would sharpen this next
+- A run that logs **attention and MLP movement separately** (not done yet): every block's MLP is
+  identical and only the attention differs, so the prediction is the ripple should **vanish in the MLP
+  view and sharpen in the attention view** — a clean confirmation the bands are the attention seam.
+- The **`curriculum`** run, for the order/forgetting comparison it was built for.
+- These norms are *absolute* move size, not move *relative to* a block's existing weights — a relative
+  view would be a useful addition.

@@ -8,6 +8,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "httpx>=0.27.0",
     "vllm>=0.6.0",          # OpenAI-compatible server engine (server.py launches it)
+    # Evaluation harness (metrics.py / evaluate.py / run_checkpoints.py):
+    "agents",               # rollout (run_eval/win_rate), OpenAICompatBackend, AgentConfig
+    "distillation",         # registry.GAMES — generic per-game (agent, env, sample_targets, good_status)
 ]
 
 [tool.uv]

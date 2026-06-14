@@ -57,6 +57,56 @@ uv run --package agents python -m agents.run --demo
 uv run --package agents python -m agents.run --episodes 20
 ```
 
+## Metrics / evaluation — score checkpoints across all games
+
+Beyond the demo, this package evaluates **trained checkpoints** behaviorally: play a fixed,
+seeded held-out test set of every game with a served checkpoint and report per-game accuracy /
+win-rate. It reuses the generic per-game wiring in `distillation/registry.py::GAMES`
+(`make_agent` / `make_env(target)` / `sample_targets(n,"val",rng)` / `good_status`) and the episode
+driver `agents/rollout.py::run_eval` — no per-game code.
+
+```
+metrics.py          pure scoring: solved/n, Wilson 95% CI, per-game + aggregate (single/multi/reasoning)
+evaluate.py         play all games × N seeded val instances against a server → eval_results/<label>.json
+run_checkpoints.py  orchestrate base + epoch checkpoints: launch server, wait ready, evaluate, teardown
+analysis/viz_eval.py blog-quality plots from the result JSONs (PEP 723 inline deps; no vLLM/torch)
+```
+
+**Run it (local, one GPU, sequential).** One command evaluates the base model + every epoch
+checkpoint of a variant (it launches/awaits/tears-down the vLLM server per checkpoint, and is
+resumable — skips any `<out>/<label>.json` that already exists):
+
+```bash
+uv run --package inference python -m inference.run_checkpoints \
+  --repo saketh-chervu/word-games-sft-wordle --epochs 1,2,3,4 --base \
+  --games all --n 300 --seed 0 --out eval_results/
+```
+
+Or evaluate a single already-running server:
+
+```bash
+uv run --package inference python -m inference.server --model saketh-chervu/word-games-sft-wordle --revision epoch-3 &
+uv run --package inference python -m inference.evaluate --label wordle-e3 --games all --n 300 --seed 0 --out eval_results/
+```
+
+**Eval set.** `--n` distinct held-out (`mode="val"`) instances per game, drawn with a fixed `--seed`
+so every checkpoint sees the *identical* test set. Sampling is frozen for fairness
+(`temperature 0.6, top_p 0.95, enable_thinking=True`). A "solved" episode is `final.status ==
+good_status` (`"won"` for wordle/codebreaker/bullscows; `"correct"` for the single-turn games).
+Checkpoints exist only at whole-epoch boundaries (training used `save_strategy="epoch"`), so the
+x-axis is `{base, e1, e2, e3, e4}`.
+
+**Plots (blog).** Render all figures from the results — no GPU needed:
+
+```bash
+uv run --no-project inference/analysis/viz_eval.py --results eval_results --out eval_plots
+```
+
+Produces: a **game × checkpoint accuracy heatmap**, **per-game accuracy** small-multiples (with
+Wilson CI bands), **aggregate** (macro / single-turn / multi-turn / reasoning) across epochs, the
+**wordle headline** (win-rate ± CI + solved-by-round), **base→best delta per game** (the transfer
+story), and **format discipline** (action-parse / `<think>` rate). PNG + SVG.
+
 ## Notes
 
 - **Single GPU, single model.** `server.py` just `exec`s `vllm serve`; vLLM owns the
