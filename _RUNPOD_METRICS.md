@@ -19,13 +19,23 @@ git clone https://github.com/SakethSigma/PixelPolicy.git && cd PixelPolicy
 git reset --hard origin/main                                     # exact pushed code (fetch is implicit on fresh clone)
 
 uv sync --package inference                                      # eval harness deps (agents + distillation + vllm)
-# vLLM has a compiled CUDA extension, so vLLM AND torch must be the SAME CUDA (12.8). Reinstall
-# vLLM for cu128 (it brings a matching torch). Do NOT just reinstall torch — that leaves vLLM
-# on cu13 → "ImportError: libcudart.so.13".
-# The LATEST vllm (0.23+) ships a CUDA-13 wheel → "libcudart.so.13" on a 12.8 driver, and
-# --torch-backend only fixes torch, NOT vllm's compiled _C. Pin a cu128 vLLM build:
-uv pip install --reinstall "vllm==0.10.2" --torch-backend=cu128
-#   walk down until the test below passes (cu128 wheel):  0.10.2 → 0.9.2 → 0.8.5.post1
+# vLLM has a compiled CUDA extension, so vLLM AND torch must be the SAME CUDA (12.8). Two
+# constraints pull in opposite directions, so you must hit a WINDOW — not just "pin low":
+#   1. Qwen3.5 (Qwen3_5ForConditionalGeneration) needs vLLM >= 0.17.0. Older vllm (e.g. 0.10.2)
+#      errors: "Model architectures ['Qwen3_5ForConditionalGeneration'] are not supported".
+#   2. vLLM >= ~0.21 defaults to a CUDA-13 wheel → "libcudart.so.13" on a 12.8 driver. And
+#      --torch-backend=cu128 only fixes TORCH's index, NOT vllm's own compiled _C — so even with
+#      cu128 torch, a cu13 vllm wheel still dies (vllm#43435).
+# => Target vLLM 0.17–0.20: new enough for Qwen3.5, old enough to still ship a cu128 wheel.
+# 0.19.0 is CONFIRMED working on the A100 pod (cu128, Qwen3.5 loads). Use it:
+uv pip install --reinstall "vllm==0.19.0" --torch-backend=cu128
+#   if it ever fails the `vllm --version` test below, walk DOWN: 0.19.0 → 0.18.0 → 0.17.0
+#   (0.20.0+ may drag in cu13 → "libcudart.so.13")
+# If a version still drags in cu13, install its explicit cu128 RELEASE wheel directly (skips the
+# PyPI default; some URLs 404 → try the next minor, vllm#37847):
+#   uv pip install https://github.com/vllm-project/vllm/releases/download/v0.18.0/vllm-0.18.0+cu128-cp38-abi3-manylinux1_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cu128
+# CLEANER if you control the image: use a CUDA-13 RunPod template (driver >= 580) instead of the
+# "PyTorch 2.4.0" (CUDA 12.1) one, then plain `uv pip install vllm` (latest, cu13) just works.
 
 export HF_TOKEN=hf_xxxxxxxx                                      # needed to DOWNLOAD the (private) checkpoints
 # REAL test — loads the compiled _C extension (NOT just `import vllm`); must print a version, no libcudart:
@@ -37,7 +47,7 @@ uv run --no-sync --package inference vllm --version
 ```bash
 uv run --no-sync --package inference python -m inference.run_checkpoints \
   --repo saketh-chervu/word-games-sft-wordle --epochs 1,2,3,4 --base \
-  --games all --n 300 --seed 0 --enforce-eager --concurrency 32 \
+  --games all --n 300 --seed 0 --concurrency 512 --max-num-seqs 512 \
   --out /workspace/eval_results_v2/ \
   --push-results-repo saketh-chervu/word-games-eval --push-results-revision main
 ```
@@ -45,6 +55,11 @@ uv run --no-sync --package inference python -m inference.run_checkpoints \
   volume, and **auto-uploads the whole eval dir to `saketh-chervu/word-games-eval` after each
   checkpoint** (created automatically; a *dedicated* repo so model weights aren't mixed in). No
   manual upload — launch it in tmux and walk away.
+- **Throughput on the A100:** NO `--enforce-eager` (that's a WSL/no-nvcc local workaround; it kills
+  CUDA-graph speed — a 0.8B is launch-overhead-bound, so eager ~10×'d our latency). `--concurrency`
+  = how many games the client plays in parallel; `--max-num-seqs` raises vLLM's 256 default cap so
+  they actually run concurrently (else the overflow just queues — `Waiting: N` in the server log).
+  Watch the log: `Running:` should reach ~512 with `Waiting: 0` and KV cache well under 90%.
 - **Crash-tolerant:** if the vLLM server dies, re-run the *same* command — resume-from-raw skips
   completed episodes and continues. If the A100 OOMs (it won't at 0.8B), lower `--concurrency` /
   add `--max-model-len 4096`.
