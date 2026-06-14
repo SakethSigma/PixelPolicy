@@ -86,6 +86,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--gradlog-steps", type=int, default=50,
                     help="log per-layer grad/update norms to wandb every N steps (0 disables). "
                          "See LEARNING_DYNAMICS_NOTES.md.")
+    ap.add_argument("--game-probe-steps", type=int, default=0,
+                    help="every N steps, probe EACH game's per-layer/component grad signature → "
+                         "<output_dir>/grad_probe.jsonl (which game drives which layer). 0 = off.")
+    ap.add_argument("--game-probe-k", type=int, default=8,
+                    help="probe batch size per game; keep <= --per-device-batch-size (uses less "
+                         "memory than a training step, so no batch change needed).")
     # hub
     ap.add_argument("--push-to-hub", action="store_true")
     ap.add_argument("--hub-model-id", default=None)
@@ -265,6 +271,16 @@ def main(argv: list[str] | None = None) -> None:
         from training.sft.dynamics import GradUpdateNormCallback
         callbacks.append(GradUpdateNormCallback(every=args.gradlog_steps))
         print(f"[train] logging per-layer grad/update norms to wandb every {args.gradlog_steps} steps")
+    if args.game_probe_steps > 0:
+        from training.sft.dynamics import PerGameGradProbe, build_game_probes
+        probe_games = ["wordle"] if args.variant == "wordle" else list(GAME_NO)
+        probes = build_game_probes(args.dataset_repo, tokenizer, probe_games,
+                                   k=args.game_probe_k, max_len=args.max_seq_len,
+                                   split=args.eval_split, seed=args.seed)
+        callbacks.append(PerGameGradProbe(probes, every=args.game_probe_steps,
+                                          output_dir=output_dir, bf16=args.bf16))
+        print(f"[train] per-game grad probe every {args.game_probe_steps} steps "
+              f"({len(probes)} games) → {output_dir}/grad_probe.jsonl")
 
     ordered = args.variant == "curriculum" and args.curriculum_strategy in ORDERED_STRATEGIES
     trainer_cls = _make_sequential_trainer_cls(SFTTrainer) if ordered else SFTTrainer

@@ -1,9 +1,18 @@
 # RunPod training commands (temp — delete when done)
 
-Push the latest `main` first (this env has no GitHub creds). **torch must be the cu128 wheel
-installed manually** — do NOT rely on `uv sync` for torch, and **run everything with `--no-sync`**
-(plain `uv sync`/`uv run` re-resolve torch and break it: either cu130 = "driver too old", or missing
-`libcudnn.so.9`).
+Push the latest `main` first. **Two hard rules that this saga taught us:**
+1. **Write checkpoints to `/workspace`** (the persistent volume), NEVER to the repo under `/` (the
+   ephemeral *container disk* — it dies with the container / can't be migrated). `--output-dir
+   /workspace/runs/<variant>`.
+2. **Always run inside `tmux`** — a web-terminal/internet drop kills your *view*, not the job, and
+   `tmux attach` gets the session back. (Losing your internet does NOT stop the RunPod container.)
+
+Plus: torch must be the cu128 wheel (`uv pip install … cu128`) and every `uv run` uses `--no-sync`
+(plain `uv sync`/`uv run` re-resolve torch → cu130 "driver too old" or missing `libcudnn.so.9`).
+
+**Container disk vs volume:** a pod = a container (`/`, ephemeral, ~dies on stop/migrate/recreate)
+**+** a persistent volume (`/workspace`, survives). The repo/`.venv` can live on `/` (re-cloneable);
+**checkpoints must live on `/workspace`** so a pod death never strands them.
 
 ---
 
@@ -15,14 +24,13 @@ git push origin main
 
 ---
 
-## One-time setup on EACH RunPod pod (template: Runpod Pytorch 2.4.0 · GPU: A100 80 GB · disk ≥50 GB)
-
-> **GPU: A100 80 GB** (PCIe ~$1.39/hr, or SXM). 80 GB removes the large-vocab memory pressure — batch
-> 16–32 fits comfortably. (A40 48 GB also works *with* the default `chunked_nll` loss; A100 just ends
-> the OOM fights. `chunked_nll` is identical math to `nll`, just lower memory — TRL is making it the
-> default in 1.7.)
+## One-time setup on EACH RunPod pod (template: Runpod Pytorch 2.4.0 · GPU: A100 80 GB)
 
 ```bash
+# 0. ALWAYS work inside tmux (survives terminal/internet drops; reconnect with `tmux attach`)
+apt-get update && apt-get install -y tmux       # not preinstalled in the RunPod image
+tmux new -s train
+
 # 1. install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
@@ -35,36 +43,33 @@ cd PixelPolicy
 uv sync --package training
 uv pip install torch --reinstall --index-url https://download.pytorch.org/whl/cu128
 
-# 4. secrets (replace). Do NOT set WANDB_PROJECT (trainer forces it).
+# 4. secrets. Do NOT set WANDB_PROJECT (trainer forces it).
 export HF_TOKEN=hf_xxxxxxxx
 export WANDB_API_KEY=xxxxxxxx
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 5. verify  → MUST print  <ver>+cu128 True   (note --no-sync)
+# 5. verify  → MUST print  <ver>+cu128 True
 uv run --no-sync --package training python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-
-# 6. (OPTIONAL) smoke test — longest sequences + chunked_nll loss; prints max seq len + batch fit.
-#     Only honest once the latest main is pushed/pulled (older healthcheck runs plain nll → false OOM).
-#     You can SKIP this and go straight to training: train.py already defaults to chunked_nll.
-uv run --no-sync --package training python -m training.sft.healthcheck --variant full --bf16 \
-  --gradient-checkpointing --sweep 4,8,16,32 --max-seq-len 4096
 ```
 
-> **If step 5 fails** (`+cu130`, or `libcudnn.so.9` missing): you ran a plain `uv sync`/`uv run`
-> which reverted torch. Re-run the `uv pip install torch … cu128` line, then always use `--no-sync`.
+> **If step 5 fails** (`+cu130` / missing `libcudnn.so.9`): re-run the `uv pip install torch … cu128`
+> line, then always use `--no-sync`.
 
-A100 80 GB fits **batch 32** (the jobs below use it). Effective batch = 32 × `--grad-accum 2` = **64**,
-with `--lr 3e-5` scaled for it. **Keep batch + grad-accum + lr IDENTICAL across all three jobs** — a
-different effective batch or LR would confound the wordle/full/curriculum comparison. Run each in
-`tmux`; epochs push to the Hub as they finish.
+Batch 32 × `--grad-accum 2` = effective 64, `--lr 3e-5`. **Keep batch/accum/lr identical across the
+three jobs** (else the comparison is confounded). Smaller GPU? keep effective batch 64 (e.g. `16 × 4`).
 
 ---
+
+## Training jobs — FRESH runs (start a new run here)
+
+> A brand-new training run (from the base model) = run the matching Job below. **Don't** use the
+> Crash-recovery section for a fresh run — that's only for continuing an interrupted one.
 
 ## Job 1 — wordle-only baseline
 
 ```bash
 uv run --no-sync --package training python -m training.sft.train --variant wordle \
-  --output-dir ./runs/wordle --epochs 4 --lr 3e-5 \
+  --output-dir /workspace/runs/wordle --epochs 4 --lr 3e-5 \
   --per-device-batch-size 32 --grad-accum 2 --max-seq-len 4096 \
   --bf16 --gradient-checkpointing \
   --report-to wandb --run-name wordle --wandb-project pixelpolicy-sft \
@@ -73,41 +78,78 @@ uv run --no-sync --package training python -m training.sft.train --variant wordl
 
 ## Job 2 — full set, no curriculum
 
+> The original `…-sft-full` repo holds the dead run's epoch-1/2 — **don't overwrite it.** Push this
+> clean re-run to a NEW id (`…-sft-full-v2`) and use a distinct `--run-name`/`--output-dir`.
+
 ```bash
 uv run --no-sync --package training python -m training.sft.train --variant full \
-  --output-dir ./runs/full --epochs 4 --lr 3e-5 \
+  --output-dir /workspace/runs/full-v2 --epochs 4 --lr 3e-5 \
   --per-device-batch-size 32 --grad-accum 2 --max-seq-len 4096 \
   --bf16 --gradient-checkpointing \
-  --report-to wandb --run-name full --wandb-project pixelpolicy-sft \
-  --push-to-hub --hub-model-id saketh-chervu/word-games-sft-full --hub-per-epoch
+  --report-to wandb --run-name full-v2 --wandb-project pixelpolicy-sft \
+  --push-to-hub --hub-model-id saketh-chervu/word-games-sft-full-v2 --hub-per-epoch \
+  --game-probe-steps 250
 ```
+> `--game-probe-steps 250` → every 250 steps, probe each game's per-layer/component grad signature
+> to `/workspace/runs/full-v2/grad_probe.jsonl` (which game drives which layer — for offline analysis).
+> Cheap, off-GPU-memory-neutral (runs after the step, batch `k=8` < training batch). 0 disables.
 
 ## Job 3 — full set, curriculum (widening)
 
 ```bash
 uv run --no-sync --package training python -m training.sft.train --variant curriculum \
-  --curriculum-strategy widening --output-dir ./runs/curriculum --epochs 4 --lr 3e-5 \
+  --curriculum-strategy widening --output-dir /workspace/runs/curriculum --epochs 4 --lr 3e-5 \
   --per-device-batch-size 32 --grad-accum 2 --max-seq-len 4096 \
   --bf16 --gradient-checkpointing \
   --report-to wandb --run-name curriculum-widening --wandb-project pixelpolicy-sft \
-  --push-to-hub --hub-model-id saketh-chervu/word-games-sft-curriculum --hub-per-epoch
+  --push-to-hub --hub-model-id saketh-chervu/word-games-sft-curriculum --hub-per-epoch \
+  --game-probe-steps 250
 ```
+(wordle Job 1 is single-game, so the per-game probe is trivial there — omit it, or use a small
+`--game-probe-steps 50` since wordle has few steps.)
+
+---
+
+## Crash recovery — resume an INTERRUPTED run (NOT for fresh runs)
+
+> Use this **only** to continue a run that already produced ≥1 checkpoint and then died. For a
+> brand-new run, use the Job commands above. (A run started with the *old* code has no `resume`
+> branch and can't be resumed — start it fresh instead.)
+
+Each epoch now pushes TWO things to HF:
+- `epoch-1..4` — weights-only (for inference), and
+- **`resume`** — the **FULL** checkpoint (optimizer + scheduler + RNG + trainer_state), overwritten
+  each epoch. So even if the pod and its `/workspace` are both gone, the last completed epoch is
+  recoverable from HF.
+
+On a fresh GPU pod (after the one-time setup above):
+```bash
+cd /PixelPolicy
+mkdir -p /workspace/runs/<variant>
+huggingface-cli download saketh-chervu/word-games-sft-<variant> --revision resume \
+  --local-dir /workspace/runs/<variant>/resume-ckpt
+
+# resume — restores optimizer/scheduler/step/epoch and finishes the remaining epochs:
+uv run --no-sync --package training python -m training.sft.train --variant <variant> \
+  --output-dir /workspace/runs/<variant> --epochs 4 --lr 3e-5 \
+  --per-device-batch-size 32 --grad-accum 2 --max-seq-len 4096 --bf16 --gradient-checkpointing \
+  --report-to wandb --run-name <name> --wandb-project pixelpolicy-sft \
+  --push-to-hub --hub-model-id saketh-chervu/word-games-sft-<variant> --hub-per-epoch \
+  --resume-from /workspace/runs/<variant>/resume-ckpt
+```
+(If `/workspace` on the *same* pod survived, skip the download and just add `--resume` — it
+auto-finds the latest local checkpoint.)
 
 ---
 
 ## Notes
 
-- **`--no-sync` on EVERY `uv run`** — non-negotiable. Plain `uv sync`/`uv run` re-resolve torch and
-  break CUDA. Install torch once (step 3) and never let uv touch it again.
-- **OOM fix:** Qwen3.5's ~248k vocab → huge fp32 cross-entropy logits. Trainer defaults to
-  `loss_type=chunked_nll` (chunks the loss). Rows over `--max-seq-len` are dropped, not truncated.
-  Still OOM? lower `--per-device-batch-size`, raise `--grad-accum` to keep the effective batch.
-- **Tracking:** wandb project `pixelpolicy-sft`; runs `wordle` / `full` / `curriculum-widening`;
-  per-layer `gradnorm/*` + `updnorm/*` panels. Don't set `WANDB_PROJECT`.
-- **Checkpoints:** `saketh-chervu/word-games-sft-<variant>`, revisions `epoch-1..4` (+ final on
-  `main`), weights-only — for per-checkpoint inference eval (`vllm … --revision epoch-N`).
-- **Smoke train** first (optional): append `--max-steps 5 --epochs 1 --eval-samples-per-game 8 --eval-samples-all 16`.
-- **Disk:** pod volume ≥50 GB (torch + model + 4 epoch checkpoints).
-- **Push everything first:** Step 0 must include the latest commits (cu128 pin removed, over-length
-  filter, healthcheck uses chunked_nll). `git log origin/main..main` should be empty after pushing.
+- **`--no-sync` on EVERY `uv run`** — non-negotiable; install torch once (step 3), never let uv touch it.
+- **OOM:** Qwen3.5's ~248k vocab → huge fp32 cross-entropy logits; trainer defaults to
+  `loss_type=chunked_nll`. Over-length rows are dropped. Still OOM? lower batch, raise grad-accum.
+- **Checkpoints:** `epoch-1..4` (weights-only, inference) + `resume` (full, recovery) on the Hub, AND
+  local full checkpoints under `/workspace/runs/<variant>/`.
+- **Tracking:** wandb project `pixelpolicy-sft`; per-layer `gradnorm/*` + `updnorm/*` panels now also
+  split per block into `attn_NN` / `mlp_NN` / `norm_NN` (plus the whole-block `layer_NN`).
+- **Push everything first:** `git log origin/main..main` should be empty after Step 0.
 ```
