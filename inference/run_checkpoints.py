@@ -56,11 +56,15 @@ def _wait_ready(base_url: str, proc: subprocess.Popen, timeout: float) -> None:
     raise TimeoutError(f"server not ready after {timeout:.0f}s")
 
 
-def _serve(model: str, revision: str | None, host: str, port: int) -> subprocess.Popen:
+def _serve(model: str, revision: str | None, host: str, port: int,
+           enforce_eager: bool = False) -> subprocess.Popen:
     cmd = [sys.executable, "-m", "inference.server", "--model", model,
            "--host", host, "--port", str(port)]
     if revision:
         cmd += ["--revision", revision]
+    if enforce_eager:
+        # Skip CUDA-graph capture (very slow on WSL/12GB and re-run per server) → fast startup.
+        cmd += ["--enforce-eager"]
     print(f"[orchestrator] launching: {' '.join(cmd)}", file=sys.stderr)
     # New session so the whole vLLM process group can be signalled on teardown.
     return subprocess.Popen(cmd, start_new_session=True)
@@ -89,12 +93,18 @@ def _main() -> None:
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--concurrency", type=int, default=8)
-    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="max NEW tokens generated per turn (2048 truncated ~14% of thinking turns).")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--ready-timeout", type=float, default=900.0)
+    ap.add_argument("--ready-timeout", type=float, default=1800.0)
+    ap.add_argument("--enforce-eager", action="store_true",
+                    help="pass --enforce-eager to vLLM — skips slow CUDA-graph capture (recommended "
+                         "on WSL/12GB; capture otherwise re-runs ~20-30 min per checkpoint).")
     ap.add_argument("--show", type=int, default=0,
                     help="print the first N raw episodes per game per checkpoint (format check).")
+    ap.add_argument("--no-store-raw", action="store_true",
+                    help="do NOT persist raw per-episode predictions (default: store to out/raw/<label>/).")
     ap.add_argument("--out", default="eval_results")
     args = ap.parse_args()
 
@@ -114,13 +124,14 @@ def _main() -> None:
             print(f"[orchestrator] skip {label} (exists: {out_path})", file=sys.stderr)
             done.append(label)
             continue
-        proc = _serve(model, revision, args.host, args.port)
+        proc = _serve(model, revision, args.host, args.port, enforce_eager=args.enforce_eager)
         try:
             _wait_ready(base_url, proc, args.ready_timeout)
             print(f"[orchestrator] {label} server ready → evaluating", file=sys.stderr)
             run_and_save(label=label, model=model, revision=revision, base_url=base_url,
                          games=games, n=args.n, seed=args.seed, concurrency=args.concurrency,
-                         max_tokens=args.max_tokens, out=args.out, show=args.show)
+                         max_tokens=args.max_tokens, out=args.out, show=args.show,
+                         store_raw=not args.no_store_raw)
             done.append(label)
         finally:
             _teardown(proc)

@@ -96,6 +96,21 @@ good_status` (`"won"` for wordle/codebreaker/bullscows; `"correct"` for the sing
 Checkpoints exist only at whole-epoch boundaries (training used `save_strategy="epoch"`), so the
 x-axis is `{base, e1, e2, e3, e4}`.
 
+**Raw predictions are the source of truth.** Every episode is persisted *incrementally* (appended +
+flushed as it finishes) to `eval_results/raw/<label>/<game>.jsonl` — target, outcome, and each turn's
+raw reply + parsed action. So a crash never loses completed episodes, and **any new metric is
+recomputed offline with no re-inference** (`--no-store-raw` to opt out). To derive metrics from
+stored raw:
+
+```bash
+# recompute metrics for every label from raw (after editing metrics.py, or just to rebuild the JSONs):
+uv run --package inference python -m inference.recompute --raw eval_results/raw --out eval_results
+# a single checkpoint:
+uv run --package inference python -m inference.recompute --raw eval_results/raw/wordle-e4 --out eval_results
+```
+Adding a metric = edit `inference/metrics.py::game_metrics` (it sees each episode's turns: `action`,
+`response`, `status`), then run `recompute` — the expensive generation is never repeated.
+
 **Plots (blog).** Render all figures from the results — no GPU needed:
 
 ```bash
