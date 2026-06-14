@@ -277,10 +277,12 @@ def main(argv: list[str] | None = None) -> None:
         probes = build_game_probes(args.dataset_repo, tokenizer, probe_games,
                                    k=args.game_probe_k, max_len=args.max_seq_len,
                                    split=args.eval_split, seed=args.seed)
-        callbacks.append(PerGameGradProbe(probes, every=args.game_probe_steps,
-                                          output_dir=output_dir, bf16=args.bf16))
+        callbacks.append(PerGameGradProbe(
+            probes, every=args.game_probe_steps, output_dir=output_dir, bf16=args.bf16,
+            hub_model_id=(args.hub_model_id if args.push_to_hub else None), private=args.hub_private))
         print(f"[train] per-game grad probe every {args.game_probe_steps} steps "
-              f"({len(probes)} games) → {output_dir}/grad_probe.jsonl")
+              f"({len(probes)} games) → {output_dir}/grad_probe.jsonl"
+              + (f" + HF {args.hub_model_id}@probe each epoch" if args.push_to_hub else ""))
 
     ordered = args.variant == "curriculum" and args.curriculum_strategy in ORDERED_STRATEGIES
     trainer_cls = _make_sequential_trainer_cls(SFTTrainer) if ordered else SFTTrainer

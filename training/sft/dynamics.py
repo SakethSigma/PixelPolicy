@@ -177,14 +177,22 @@ def _build_probe_callback():
     from transformers import TrainerCallback
 
     class PerGameGradProbe(TrainerCallback):
-        """Per-game gradient probe → `<output_dir>/grad_probe.jsonl` (does not affect training)."""
+        """Per-game gradient probe → `<output_dir>/grad_probe.jsonl` (does not affect training).
 
-        def __init__(self, probes: dict, *, every: int = 500, output_dir: str = ".", bf16: bool = True):
+        Auto-exfils the JSONL so no manual step is needed: each epoch it's pushed to HF
+        (`<hub_model_id>@probe/grad_probe.jsonl`) and synced to wandb. The volume keeps the file too.
+        """
+
+        def __init__(self, probes: dict, *, every: int = 500, output_dir: str = ".", bf16: bool = True,
+                     hub_model_id: str | None = None, private: bool = True):
             self.probes = probes
             self.every = max(1, every)
             self.path = os.path.join(output_dir, "grad_probe.jsonl")
             self.bf16 = bf16
+            self.hub_model_id = hub_model_id
+            self.private = private
             self._model = None
+            self._wandb_saved = False
             os.makedirs(output_dir, exist_ok=True)
 
         def on_train_begin(self, args, state, control, model=None, **kw):
@@ -211,9 +219,40 @@ def _build_probe_callback():
             with open(self.path, "a") as f:
                 for r in records:
                     f.write(json.dumps(r) + "\n")
+            self._wandb_sync()
             print(f"[grad-probe] step {state.global_step}: {len(records)} games → {self.path}",
                   file=sys.stderr)
             return control
+
+        def on_save(self, args, state, control, **kw):
+            self._exfil_hub()                    # push the latest JSONL to HF each epoch
+            return control
+
+        def on_train_end(self, args, state, control, **kw):
+            self._exfil_hub()
+            self._wandb_sync()
+            return control
+
+        def _wandb_sync(self) -> None:
+            if self._wandb_saved:
+                return
+            try:
+                import wandb
+                if wandb.run is not None and os.path.exists(self.path):
+                    wandb.save(self.path, policy="live")     # syncs the file (and its updates) to the run
+                    self._wandb_saved = True
+            except Exception as e:                            # noqa: BLE001 — never break training on telemetry
+                print(f"[grad-probe] wandb sync skipped: {e}", file=sys.stderr)
+
+        def _exfil_hub(self) -> None:
+            if not self.hub_model_id or not os.path.exists(self.path):
+                return
+            try:
+                from training.sft.upload import push_file
+                push_file(self.path, self.hub_model_id, "grad_probe.jsonl",
+                          revision="probe", private=self.private)
+            except Exception as e:                            # noqa: BLE001 — push failure must not kill training
+                print(f"[grad-probe] HF push skipped: {e}", file=sys.stderr)
 
     return PerGameGradProbe
 

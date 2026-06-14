@@ -46,6 +46,24 @@ def push_checkpoint(local_dir: str, hub_model_id: str, *, revision: str | None =
     return f"{hub_model_id}@{where}"
 
 
+def push_file(local_path: str, hub_model_id: str, path_in_repo: str, *, revision: str = "probe",
+              private: bool = True, token: str | None = None) -> str:
+    """Upload a single file (e.g. grad_probe.jsonl) to a branch of the model repo. Best-effort
+    exfil channel for analysis artifacts from a pod with no git."""
+    from huggingface_hub import HfApi
+
+    token = token or os.getenv("HF_TOKEN")
+    api = HfApi(token=token)
+    api.create_repo(hub_model_id, repo_type="model", private=private, exist_ok=True)
+    if revision and revision != "main":
+        api.create_branch(hub_model_id, branch=revision, exist_ok=True)
+    api.upload_file(path_or_fileobj=local_path, path_in_repo=path_in_repo, repo_id=hub_model_id,
+                    repo_type="model", revision=revision,
+                    commit_message=f"probe {os.path.basename(local_path)}")
+    print(f"[upload] {local_path} → {hub_model_id} ({revision}/{path_in_repo})")
+    return f"{hub_model_id}@{revision}/{path_in_repo}"
+
+
 def _epoch_callback_base():
     """Build the callback class lazily so importing this module doesn't require transformers."""
     from transformers import TrainerCallback
