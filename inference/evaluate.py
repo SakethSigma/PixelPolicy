@@ -88,12 +88,12 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     """Play N seeded held-out (`val`) instances of one game and return its metrics.
 
     If `show > 0`, the first `show` episodes are played sequentially and printed *immediately*.
-    Raw predictions are appended + flushed to `raw_dir/<game>.jsonl` the instant EACH episode
-    finishes (source of truth) — independent of `concurrency`, so a crash/Ctrl-C never loses
-    completed work.
-    **Resumable:** on restart we read which *targets* are already on disk and run only the missing
-    ones (resume by target identity, not line count), so records may land in completion order and a
-    half-written final line from a hard crash is tolerated.
+    Raw predictions are flushed to `raw_dir/<game>.jsonl` as episodes finish, but in TARGET ORDER
+    (a finished episode waits until all earlier ones are written) — so the file stays ordered and
+    resume-by-count is exact. Per-episode flush means a crash loses at most the small in-flight tail.
+    **Resumable:** on restart we skip the first M = (valid records already on disk) targets and
+    continue. Ordered writes keep this dup-proof; a half-written final line from a crash is ignored.
+    Game-independent: we never key on the target VALUE (games transform it — e.g. wordle uppercases).
     """
     from agents.rollout import run_episode, run_eval
 
@@ -102,17 +102,18 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     agent = spec.make_agent()
 
     jsonl = os.path.join(raw_dir, f"{name}.jsonl") if raw_dir else None
-    done_keys: set[str] = set()                       # targets already on disk → resume by identity
+    done = 0
     if jsonl and os.path.exists(jsonl):
-        with open(jsonl) as f:
+        with open(jsonl) as f:                        # count only VALID records (ignore a torn last line)
             for line in f:
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
-                try:                                  # tolerate a half-written last line from a crash
-                    done_keys.add(json.dumps(json.loads(line).get("target"), sort_keys=True))
+                try:
+                    json.loads(line)
+                    done += 1
                 except json.JSONDecodeError:
                     continue
+        done = min(done, n)                            # cap: a file with stray dupes still resumes as "done"
     raw_f = None
     if raw_dir:
         os.makedirs(raw_dir, exist_ok=True)
@@ -124,8 +125,7 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
                 tr, game=name, game_no=GAME_NUMBERS[name], good_status=spec.good_status)) + "\n")
             raw_f.flush()
 
-    remaining = [t for t in targets if json.dumps(t, sort_keys=True) not in done_keys]
-    done = n - len(remaining)
+    remaining = targets[done:]
     if done:
         print(f"  {name}: resuming — {done}/{n} already on disk", file=sys.stderr)
     trajs = []
@@ -140,13 +140,21 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     rest = remaining[k:]
     pairs = [(agent, spec.make_env(t)) for t in rest]
 
-    def _on_result(_i, tr) -> None:                    # flush EACH episode the instant it finishes
-        nonlocal made
-        _persist(tr)
-        made += 1
-        if made % 20 == 0 or made == n:
-            print(f"  {name}: {made}/{n}", file=sys.stderr)
-            sys.stderr.flush()
+    # Flush in target order: a finished episode i waits in `pending` until every earlier episode is
+    # written, so the JSONL stays ordered → resume-by-count is exact and CANNOT duplicate.
+    next_write = 0
+    pending: dict = {}
+
+    def _on_result(i, tr) -> None:
+        nonlocal next_write, made
+        pending[i] = tr
+        while next_write in pending:
+            _persist(pending.pop(next_write))
+            next_write += 1
+            made += 1
+            if made % 20 == 0 or made == n:
+                print(f"  {name}: {made}/{n}", file=sys.stderr)
+                sys.stderr.flush()
 
     trajs.extend(run_eval(pairs, generate, concurrency=concurrency, on_result=_on_result))
     if raw_f is not None:
