@@ -117,12 +117,17 @@ def run_eval(
     generate: Generate,
     *,
     concurrency: int = 8,
+    on_result=None,
 ) -> list[Trajectory]:
     """Run many already-reset ``(agent, env)`` episodes concurrently.
 
     Concurrency is at the episode level (a thread per in-flight game); the inference
     server batches the overlapping requests itself (e.g. vLLM continuous batching), so
     we don't hand-vectorize generation here.
+
+    ``on_result(i, traj)`` (if given) is called on the MAIN thread the instant each
+    episode finishes — used by the eval to flush every completed episode to disk
+    immediately, so a crash/Ctrl-C never loses finished work (resume picks up the rest).
     """
     pairs = list(pairs)
     results: list[Trajectory | None] = [None] * len(pairs)
@@ -132,7 +137,11 @@ def run_eval(
             for i, (agent, env) in enumerate(pairs)
         }
         for fut in as_completed(futures):
-            results[futures[fut]] = fut.result()
+            i = futures[fut]
+            tr = fut.result()
+            results[i] = tr
+            if on_result is not None:
+                on_result(i, tr)
     return [r for r in results if r is not None]
 
 

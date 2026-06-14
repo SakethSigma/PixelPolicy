@@ -88,10 +88,12 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     """Play N seeded held-out (`val`) instances of one game and return its metrics.
 
     If `show > 0`, the first `show` episodes are played sequentially and printed *immediately*.
-    Raw predictions are appended + flushed to `raw_dir/<game>.jsonl` per episode (source of truth).
-    **Resumable:** if that JSONL already has M records (e.g. after a server crash), the first M
-    targets are skipped and we continue — `sample_targets` is deterministic for the seed, so record i
-    aligns with target i. So a crashed eval just re-runs and picks up where it stopped.
+    Raw predictions are appended + flushed to `raw_dir/<game>.jsonl` the instant EACH episode
+    finishes (source of truth) — independent of `concurrency`, so a crash/Ctrl-C never loses
+    completed work.
+    **Resumable:** on restart we read which *targets* are already on disk and run only the missing
+    ones (resume by target identity, not line count), so records may land in completion order and a
+    half-written final line from a hard crash is tolerated.
     """
     from agents.rollout import run_episode, run_eval
 
@@ -100,10 +102,17 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     agent = spec.make_agent()
 
     jsonl = os.path.join(raw_dir, f"{name}.jsonl") if raw_dir else None
-    done = 0
+    done_keys: set[str] = set()                       # targets already on disk → resume by identity
     if jsonl and os.path.exists(jsonl):
         with open(jsonl) as f:
-            done = min(sum(1 for _ in f), n)          # episodes already on disk → resume past them
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:                                  # tolerate a half-written last line from a crash
+                    done_keys.add(json.dumps(json.loads(line).get("target"), sort_keys=True))
+                except json.JSONDecodeError:
+                    continue
     raw_f = None
     if raw_dir:
         os.makedirs(raw_dir, exist_ok=True)
@@ -115,9 +124,10 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
                 tr, game=name, game_no=GAME_NUMBERS[name], good_status=spec.good_status)) + "\n")
             raw_f.flush()
 
+    remaining = [t for t in targets if json.dumps(t, sort_keys=True) not in done_keys]
+    done = n - len(remaining)
     if done:
         print(f"  {name}: resuming — {done}/{n} already on disk", file=sys.stderr)
-    remaining = targets[done:]
     trajs = []
     made = done
     k = 0 if done else min(show, n)                    # skip the streamed preview when resuming
@@ -127,16 +137,18 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
             tr = run_episode(agent, spec.make_env(remaining[i]), generate)
             _print_one(name, tr, i)
             trajs.append(tr); _persist(tr); made += 1
-    chunk = max(concurrency, 20)
     rest = remaining[k:]
-    for i in range(0, len(rest), chunk):
-        pairs = [(agent, spec.make_env(t)) for t in rest[i:i + chunk]]
-        batch = run_eval(pairs, generate, concurrency=concurrency)
-        for tr in batch:
-            _persist(tr)
-        trajs.extend(batch); made += len(batch)
-        print(f"  {name}: {made}/{n}", file=sys.stderr)
-        sys.stderr.flush()
+    pairs = [(agent, spec.make_env(t)) for t in rest]
+
+    def _on_result(_i, tr) -> None:                    # flush EACH episode the instant it finishes
+        nonlocal made
+        _persist(tr)
+        made += 1
+        if made % 20 == 0 or made == n:
+            print(f"  {name}: {made}/{n}", file=sys.stderr)
+            sys.stderr.flush()
+
+    trajs.extend(run_eval(pairs, generate, concurrency=concurrency, on_result=_on_result))
     if raw_f is not None:
         raw_f.close()
 
