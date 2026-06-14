@@ -73,6 +73,21 @@ def _serve(model: str, revision: str | None, host: str, port: int,
     return subprocess.Popen(cmd, start_new_session=True)
 
 
+def _push_results(out_dir: str, repo: str, revision: str) -> None:
+    """Upload the whole eval results dir (metrics + raw/) to a branch of `repo` — hands-off exfil."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=os.getenv("HF_TOKEN"))
+        api.create_repo(repo, repo_type="model", exist_ok=True)
+        if revision != "main":
+            api.create_branch(repo, branch=revision, exist_ok=True)
+        api.upload_folder(folder_path=out_dir, repo_id=repo, repo_type="model", revision=revision,
+                          commit_message=f"eval results {os.path.basename(out_dir.rstrip('/'))}")
+        print(f"[orchestrator] pushed {out_dir} → {repo}@{revision}", file=sys.stderr)
+    except Exception as e:                                  # noqa: BLE001 — push failure must not abort the run
+        print(f"[orchestrator] results push skipped: {e}", file=sys.stderr)
+
+
 def _teardown(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
@@ -111,6 +126,10 @@ def _main() -> None:
                     help="print the first N raw episodes per game per checkpoint (format check).")
     ap.add_argument("--no-store-raw", action="store_true",
                     help="do NOT persist raw per-episode predictions (default: store to out/raw/<label>/).")
+    ap.add_argument("--push-results-repo", default=None,
+                    help="HF repo to auto-upload the whole eval dir (metrics + raw/) to after each "
+                         "checkpoint — hands-off, fetch on local. e.g. saketh-chervu/word-games-sft-wordle")
+    ap.add_argument("--push-results-revision", default="eval", help="branch for --push-results-repo.")
     ap.add_argument("--out", default="eval_results")
     args = ap.parse_args()
 
@@ -140,6 +159,8 @@ def _main() -> None:
                          max_tokens=args.max_tokens, out=args.out, show=args.show,
                          store_raw=not args.no_store_raw)
             done.append(label)
+            if args.push_results_repo:                     # auto-exfil after each checkpoint
+                _push_results(args.out, args.push_results_repo, args.push_results_revision)
         finally:
             _teardown(proc)
 

@@ -25,42 +25,34 @@ export HF_TOKEN=hf_xxxxxxxx                                      # needed to DOW
 uv run --no-sync --package inference python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # +cu128 True
 ```
 
-## 2. Run the eval (writes to the persistent volume)
+## 2. Run the eval — ONE command, fully hands-off (all epochs + base, all games, auto-push)
 
 ```bash
 uv run --no-sync --package inference python -m inference.run_checkpoints \
-  --repo saketh-chervu/word-games-sft-wordle --epochs 3,4 \
+  --repo saketh-chervu/word-games-sft-wordle --epochs 1,2,3,4 --base \
   --games all --n 300 --seed 0 --enforce-eager --concurrency 32 \
-  --out /workspace/eval_results_v2/
+  --out /workspace/eval_results_v2/ \
+  --push-results-repo saketh-chervu/word-games-eval --push-results-revision main
 ```
-- `--epochs 3,4` → just those checkpoints (run e1/e2 elsewhere). `--games wordle` = ~13× faster if you
-  only want the headline. Add `--base` for the untrained reference line.
-- Outputs: `/workspace/eval_results_v2/<label>.json` (metrics) + `raw/<label>/<game>.jsonl` (raw
-  generations, flushed per episode).
-- **Crash-tolerant:** if the vLLM server dies mid-run, re-run the *same* command — resume-from-raw
-  skips completed episodes and continues. On a tight card add `--max-model-len 4096` and lower
-  `--concurrency` (total KV ≈ concurrency × seq-len).
+- Evaluates **base + epoch-1..4** on all 13 games (300 each), writes metrics + raw to the persistent
+  volume, and **auto-uploads the whole eval dir to `saketh-chervu/word-games-eval` after each
+  checkpoint** (created automatically; a *dedicated* repo so model weights aren't mixed in). No
+  manual upload — launch it in tmux and walk away.
+- **Crash-tolerant:** if the vLLM server dies, re-run the *same* command — resume-from-raw skips
+  completed episodes and continues. If the A100 OOMs (it won't at 0.8B), lower `--concurrency` /
+  add `--max-model-len 4096`.
+- `--games wordle` = ~13× faster if you only want the headline.
 
-## 3. Push results to HF (no git on the pod)
-
-```bash
-huggingface-cli upload saketh-chervu/word-games-sft-wordle \
-  /workspace/eval_results_v2 eval_results_v2 --revision eval --repo-type model
-```
-(Uploads metrics + `raw/` to the `eval` branch of the model repo. Re-run anytime to refresh.)
-
-## 4. On LOCAL — fetch, merge, analyze (no GPU)
+## 3. On LOCAL — fetch + analyze (no GPU, nothing manual on the pod)
 
 ```bash
 cd /mnt/d/Projects/PixelPolicy
-huggingface-cli download saketh-chervu/word-games-sft-wordle --revision eval \
-  --include "eval_results_v2/**" --repo-type model --local-dir ./fetched
-cp -rn ./fetched/eval_results_v2/* ./eval_results_v2/            # merge remote e3/e4 with local e1/e2
+huggingface-cli download saketh-chervu/word-games-eval --repo-type model --local-dir ./eval_results_v2
+# (run it again anytime to pull newer checkpoints as they finish — it's incremental)
 
-# plots + paste-ready table:
-uv run --no-project inference/analysis/viz_eval.py --results eval_results_v2 --out eval_plots_v2
+uv run --no-project inference/analysis/viz_eval.py --results ./eval_results_v2 --out eval_plots_v2
 # new metric later? edit inference/metrics.py, then recompute from raw — NO re-inference:
-uv run --package inference python -m inference.recompute --raw eval_results_v2/raw --out eval_results_v2
+uv run --package inference python -m inference.recompute --raw ./eval_results_v2/raw --out ./eval_results_v2
 ```
 
 ---
