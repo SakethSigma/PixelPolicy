@@ -87,10 +87,11 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
                   raw_dir: str | None = None) -> dict:
     """Play N seeded held-out (`val`) instances of one game and return its metrics.
 
-    If `show > 0`, the first `show` episodes are played sequentially and printed *immediately*
-    (so you see raw outputs the moment the game starts), then the rest run batched via `run_eval`.
-    If `raw_dir` is set, every episode's raw record is written to `raw_dir/<game>.jsonl` (one JSON
-    line per episode) — the source of truth for recomputing metrics offline (see inference/recompute.py).
+    If `show > 0`, the first `show` episodes are played sequentially and printed *immediately*.
+    Raw predictions are appended + flushed to `raw_dir/<game>.jsonl` per episode (source of truth).
+    **Resumable:** if that JSONL already has M records (e.g. after a server crash), the first M
+    targets are skipped and we continue — `sample_targets` is deterministic for the seed, so record i
+    aligns with target i. So a crashed eval just re-runs and picks up where it stopped.
     """
     from agents.rollout import run_episode, run_eval
 
@@ -98,12 +99,15 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     targets = spec.sample_targets(n, "val", random.Random(seed))
     agent = spec.make_agent()
 
-    # Persist raw predictions INCREMENTALLY — each episode is appended + flushed the moment it
-    # finishes, so a mid-game crash still leaves every completed episode on disk.
+    jsonl = os.path.join(raw_dir, f"{name}.jsonl") if raw_dir else None
+    done = 0
+    if jsonl and os.path.exists(jsonl):
+        with open(jsonl) as f:
+            done = min(sum(1 for _ in f), n)          # episodes already on disk → resume past them
     raw_f = None
     if raw_dir:
         os.makedirs(raw_dir, exist_ok=True)
-        raw_f = open(os.path.join(raw_dir, f"{name}.jsonl"), "w")
+        raw_f = open(jsonl, "a")                       # append → don't clobber the resume point
 
     def _persist(tr) -> None:
         if raw_f is not None:
@@ -111,31 +115,38 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
                 tr, game=name, game_no=GAME_NUMBERS[name], good_status=spec.good_status)) + "\n")
             raw_f.flush()
 
+    if done:
+        print(f"  {name}: resuming — {done}/{n} already on disk", file=sys.stderr)
+    remaining = targets[done:]
     trajs = []
-    k = min(show, n)
+    made = done
+    k = 0 if done else min(show, n)                    # skip the streamed preview when resuming
     if k:
         print(f"\n--- samples: {name} (first {k}, streamed) ---", file=sys.stderr)
         for i in range(k):
-            tr = run_episode(agent, spec.make_env(targets[i]), generate)
+            tr = run_episode(agent, spec.make_env(remaining[i]), generate)
             _print_one(name, tr, i)
-            trajs.append(tr)
-            _persist(tr)
-    # Run the rest in chunks: progress counter + raw flushed per chunk (no black-box wait, no data loss).
-    rest = targets[k:]
+            trajs.append(tr); _persist(tr); made += 1
     chunk = max(concurrency, 20)
+    rest = remaining[k:]
     for i in range(0, len(rest), chunk):
         pairs = [(agent, spec.make_env(t)) for t in rest[i:i + chunk]]
         batch = run_eval(pairs, generate, concurrency=concurrency)
         for tr in batch:
             _persist(tr)
-        trajs.extend(batch)
-        solved = sum(1 for tr in trajs if getattr(tr.final, "status", None) == spec.good_status)
-        print(f"  {name}: {len(trajs)}/{n}  (solved {solved})", file=sys.stderr)
+        trajs.extend(batch); made += len(batch)
+        print(f"  {name}: {made}/{n}", file=sys.stderr)
         sys.stderr.flush()
     if raw_f is not None:
         raw_f.close()
 
-    m = game_metrics(trajs, spec.good_status)
+    # Metrics over ALL episodes (resumed + new): recompute from the file when raw is stored.
+    if jsonl and os.path.exists(jsonl):
+        from inference.recompute import _load_game
+        all_trajs, _, _ = _load_game(jsonl)
+        m = game_metrics(all_trajs, spec.good_status)
+    else:
+        m = game_metrics(trajs, spec.good_status)
     m["good_status"] = spec.good_status
     m["game_no"] = GAME_NUMBERS[name]
     return m
