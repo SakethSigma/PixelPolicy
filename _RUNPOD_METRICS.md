@@ -22,13 +22,14 @@ uv sync --package inference                                      # eval harness 
 # vLLM has a compiled CUDA extension, so vLLM AND torch must be the SAME CUDA (12.8). Reinstall
 # vLLM for cu128 (it brings a matching torch). Do NOT just reinstall torch — that leaves vLLM
 # on cu13 → "ImportError: libcudart.so.13".
-uv pip install --reinstall vllm --torch-backend=cu128
-#   if vLLM still imports cu13 (newest wheels are CUDA-13): pin a cu128 release →
-#   uv pip install --reinstall "vllm>=0.9,<0.11" --torch-backend=cu128
+# The LATEST vllm (0.23+) ships a CUDA-13 wheel → "libcudart.so.13" on a 12.8 driver, and
+# --torch-backend only fixes torch, NOT vllm's compiled _C. Pin a cu128 vLLM build:
+uv pip install --reinstall "vllm==0.10.2" --torch-backend=cu128
+#   walk down until the test below passes (cu128 wheel):  0.10.2 → 0.9.2 → 0.8.5.post1
 
 export HF_TOKEN=hf_xxxxxxxx                                      # needed to DOWNLOAD the (private) checkpoints
-# MUST succeed (no libcudart error) and print cu128 + True:
-uv run --no-sync --package inference python -c "import vllm, torch; print(vllm.__version__, torch.__version__, torch.cuda.is_available())"
+# REAL test — loads the compiled _C extension (NOT just `import vllm`); must print a version, no libcudart:
+uv run --no-sync --package inference vllm --version
 ```
 
 ## 2. Run the eval — ONE command, fully hands-off (all epochs + base, all games, auto-push)
