@@ -13,14 +13,18 @@ Model under study: **Qwen3.5-0.8B**, **24 transformer blocks** (indices 0–23),
 
 ## 1. What's built (code map)
 
-- **`training/sft/dynamics.py`** — `GradUpdateNormCallback`, a `TrainerCallback` wired into
-  `train.py` (active with `--report-to wandb`, every `--gradlog-steps` optimizer steps, default 50).
-  Logs per-bucket **gradient norm** (`gradnorm/*`) and **update norm** (`updnorm/*`) to wandb.
+- **`training/sft/dynamics.py`** — two callbacks (lazy-built; module-level `_buckets` shared):
+  - **`GradUpdateNormCallback`** (`--gradlog-steps`, default 50, needs `--report-to wandb`) — logs
+    the *training batch's* per-bucket **gradient** (`gradnorm/*`) and **update** (`updnorm/*`) norms.
+  - **`PerGameGradProbe`** (`--game-probe-steps`, default 0 = off) — *which game drives which layer.*
+    Every N steps, runs a fixed held-out probe batch **per game** through fwd+bwd in isolation and
+    writes that game's per-bucket grad norm to `<output_dir>/grad_probe.jsonl` (one line per
+    `(step, game)`). See §3b. (`build_game_probes` builds the per-game batches.)
 - **`training/analysis/viz_dynamics.py`** — standalone local viz (PEP 723 inline deps:
-  wandb/pandas/matplotlib/numpy). Pulls the logged norms from wandb and renders heatmaps + a
-  cross-run per-layer line plot. Run with `uv run --no-project training/analysis/viz_dynamics.py …`
-  (no `--with`, no torch).
-- Wired in `training/sft/train.py`: `--gradlog-steps` flag; callback appended when `report_to==wandb`.
+  wandb/pandas/matplotlib/numpy). Pulls the wandb norms and renders heatmaps + a cross-run per-layer
+  line plot. `--component layer|attn|mlp|norm`. (It plots the *wandb* batch-level norms; the per-game
+  `grad_probe.jsonl` is analyzed separately — see §3b.)
+- Wired in `training/sft/train.py`: `--gradlog-steps`, `--game-probe-steps`, `--game-probe-k`.
 
 ---
 
@@ -35,9 +39,12 @@ Model under study: **Qwen3.5-0.8B**, **24 transformer blocks** (indices 0–23),
   **`updnorm` is usually the more meaningful "how much did this part of the net move" signal.**
 
 **Buckets** (a param can land in several — see `_buckets` in `dynamics.py`):
-- `layer_NN` — the **whole** transformer block NN (attention + MLP + its layernorms).
-- `attn_NN` — that block's **self-attention** only (`self_attn.{q,k,v,o}_proj`).
-- `mlp_NN` — that block's **feed-forward** only (`mlp.{gate,up,down}_proj`).
+- `layer_NN` — the **whole** transformer block NN (attention + MLP + its layernorms). Kept
+  byte-identical to the wordle run's logging, so `layer_NN` stays comparable across all runs.
+- `attn_NN` — that block's **self-attention** (`self_attn.{q,k,v,o}_proj`, + `q_norm/k_norm`).
+- `mlp_NN` — that block's **feed-forward** (`mlp.{gate,up,down}_proj`).
+- `norm_NN` — that block's **layernorms** (`input_layernorm` / `post_attention_layernorm`).
+  (`layer_NN` == `attn_NN` + `mlp_NN` + `norm_NN` summed in quadrature.)
 - `embed`, `lm_head`, `final_norm`, `other` — non-block params.
 - `_total` — whole-model norm.
 
@@ -60,11 +67,47 @@ uv run --no-project training/analysis/viz_dynamics.py \
   --metric updnorm --component layer --out ./dynamics_plots
 ```
 - `--metric updnorm|gradnorm`
-- `--component layer|attn|mlp` (attn/mlp only exist for runs trained **after** commit `9987c57`)
+- `--component layer|attn|mlp|norm` (attn/mlp/norm only exist for runs trained with the per-block
+  split, i.e. `full-v2`/`curriculum` onward; the original `wordle` run has only `layer`)
 - `--normalize` — per-step column-normalize the heatmap (shows the *relative* distribution across
   layers at each step, removing the overall-magnitude trend)
 - Outputs: `<run>_<metric>_<component>[_norm]_heatmap.png` (layer×step) and
   `compare_<metric>_<component>_perlayer.png` (one line per run = mean over steps per layer).
+
+---
+
+## 3b. Per-game gradient probe — *which game drives which layer*
+
+The headline new analysis. The **training-batch gradient mixes games** (a batch of 32 spans many
+games), and a summed/mean gradient **cannot be decomposed per-game**. So to ask "do simple games
+drive early layers and reasoning games drive late layers," we measure each game's gradient
+**separately**: `PerGameGradProbe` periodically (every `--game-probe-steps`) runs a fixed held-out
+probe batch **per game** through forward+backward (completion-only loss, same as training, in
+isolation), records that game's per-bucket grad norm, then discards the grads (never touches the
+real optimizer step).
+
+**Output:** `<output_dir>/grad_probe.jsonl` (on the persistent `/workspace` volume), one line per
+`(step, game)`:
+```json
+{"step": 1500, "epoch": 1.0, "game": "charcount",
+ "norms": {"layer_00": .., "attn_00": .., "mlp_00": .., "norm_00": .., ..., "embed": .., "lm_head": ..}}
+```
+
+**Analysis (the deep-dive):** for each game, look at the per-layer profile (and attn/mlp/norm split)
+and how it shifts over training. Hypothesis to test: simple lookup games (charcount, validity,
+rhyme) concentrate gradient in **early** layers; reasoning games (anagram, crossword, mistakeid,
+wordle) in **later** layers. Compare game profiles at matched steps; watch movement across epochs.
+(There's no plotting script for this yet — load the JSONL with pandas; it's the raw data for the
+deep-dive, deliberately stored rather than pre-plotted.)
+
+**What the probe number IS (and isn't):**
+- It's each game's **gradient in isolation** — "if the model right now saw only game G, where across
+  layers would its loss gradient be large." A valid, standard per-task gradient signature.
+- It is **not** the Adam **update** (gradient, not ‖Δθ‖ — Adam rescales), and it **ignores
+  cross-game interference** (batched together, per-layer grads add/cancel; the probe sees each game
+  alone). The probe batch is held-out representative rows, not the literal training rows.
+- Enabled with `--game-probe-steps 250` (full/curriculum); off by default. One game at a time,
+  batch `k=8` < training batch → no extra peak GPU memory, runs at `on_step_end`.
 
 ---
 
@@ -148,22 +191,23 @@ Shape: **early layers move least, middle/upper-middle layers move most, the very
 
 ## 8. State of runs / next actions
 
-> ⚠️ **All training runs started/running so far use the OLDER callback** (pre-commit `9987c57`) that
-> logged **only the whole-block `layer_NN`** — they have **NO `attn_NN` / `mlp_NN` split**. So
-> `--component attn` and `--component mlp` will return "no data" for every existing run (including the
-> current `wordle`, and any `full`/`curriculum` started on the older code). The attn-vs-MLP view only
-> works for runs launched **after** the pod has pulled `9987c57`. Existing runs can still be analyzed
-> with `--component layer`.
+> ⚠️ The original **`wordle`** run used the OLD callback → it has **only `layer_NN`** (no
+> `attn/mlp/norm`, no `grad_probe.jsonl`). `--component attn|mlp|norm` returns "no data" for it;
+> analyze it with `--component layer`. The per-block split + per-game probe land with **`full-v2`**
+> and `curriculum` (run with the current code, commit `2f04ab0`+).
 
-- `wordle` run exists with norm data but only ~2 points (+ several dead `wordle` runs from crashes),
-  and only `layer_NN` (old code).
-- `full` / `curriculum` not yet run with the attn/mlp split (need a run after `9987c57`).
-- **To get good data:** push `main` → on pod `git pull` → run `full` and `curriculum` (default
-  `--gradlog-steps 50` is fine) and re-run `wordle` with `--gradlog-steps 10`. Then viz with
-  `--component layer|attn|mlp` and `--metric updnorm|gradnorm`.
-- **Quick wins to add when brainstorming:** plot `embed`/`lm_head`/`final_norm` series; a
-  relative-to-weight (‖Δθ‖/‖θ‖) option; param-count normalization for attn-vs-mlp; an attn+mlp
-  side-by-side figure per run.
+- `wordle` run: norm data but only ~2 points (+ several dead `wordle` runs from crashes), `layer_NN`
+  only. (The dead `full` run is gone — RunPod container-disk loss; `full-v2` is the clean re-run.)
+- **`full-v2`** (re-run with `--game-probe-steps 250`): will have wandb `attn/mlp/norm/layer` norms
+  **and** `/workspace/runs/full-v2/grad_probe.jsonl` (per-game per-layer signatures) — the real
+  dataset for the §3b deep-dive.
+- **To get good data:** push `main` → on pod `git reset --hard origin/main` → run `full-v2` /
+  `curriculum` (with `--game-probe-steps 250`); optionally re-run `wordle` with `--gradlog-steps 10`.
+  Then viz the wandb norms with `--component {layer,attn,mlp,norm}`, and load `grad_probe.jsonl` for
+  the per-game analysis.
+- **Quick wins to add when brainstorming:** a plotting script for `grad_probe.jsonl` (per-game
+  layer profiles, simple-vs-reasoning overlay); plot `embed`/`lm_head`/`final_norm` series; a
+  relative-to-weight (‖Δθ‖/‖θ‖) option; param-count normalization for attn-vs-mlp-vs-norm.
 
 ---
 
