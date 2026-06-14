@@ -148,7 +148,15 @@ Shape: **early layers move least, middle/upper-middle layers move most, the very
 
 ## 8. State of runs / next actions
 
-- `wordle` run exists with norm data but only ~2 points (+ several dead `wordle` runs from crashes).
+> ⚠️ **All training runs started/running so far use the OLDER callback** (pre-commit `9987c57`) that
+> logged **only the whole-block `layer_NN`** — they have **NO `attn_NN` / `mlp_NN` split**. So
+> `--component attn` and `--component mlp` will return "no data" for every existing run (including the
+> current `wordle`, and any `full`/`curriculum` started on the older code). The attn-vs-MLP view only
+> works for runs launched **after** the pod has pulled `9987c57`. Existing runs can still be analyzed
+> with `--component layer`.
+
+- `wordle` run exists with norm data but only ~2 points (+ several dead `wordle` runs from crashes),
+  and only `layer_NN` (old code).
 - `full` / `curriculum` not yet run with the attn/mlp split (need a run after `9987c57`).
 - **To get good data:** push `main` → on pod `git pull` → run `full` and `curriculum` (default
   `--gradlog-steps 50` is fine) and re-run `wordle` with `--gradlog-steps 10`. Then viz with
