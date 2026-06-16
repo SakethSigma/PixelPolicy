@@ -1,150 +1,275 @@
-"""Per-turn GRPO trainer on top of verl's UNPATCHED optimizer core (RAGEN-style integration).
+"""Per-turn GRPO trainer on verl 0.8.0 — subclass `RayPPOTrainer`, override ONLY `fit()`.
 
-We reuse verl for what it's good at — FSDP actor/ref workers, the vLLM/SGLang rollout engine, the
-GRPO advantage (`compute_grpo_outcome_advantage`, grouped by `uid`), the DAPO actor update
-(clip-higher / token-mean / dynamic sampling / KL), and checkpoint/push — and replace ONLY the
-rollout step with our per-turn driver (`rollout.roll_batch`) + packer (`sample_packing.to_dataproto`).
+The integration is deliberately minimal (the lightweight path on the trainer side): we let verl's
+`run_ppo` do ALL the heavy setup (ray init, worker groups, rollout engine / `async_rollout_manager`,
+checkpoint manager, dataloader, `init_workers`) by monkeypatching our subclass in as `RayPPOTrainer`.
+We override just `fit()` to:
 
-Structure of one training step (`_fit` loop):
-  1. draw `B` train targets; expand each to `G` episodes (`rollout.make_groups`)
-  2. `roll_batch(... batch_generate=<verl rollout engine> ...)` → per-turn samples (uid=(target,round))
-  3. `to_dataproto(samples)` → verl `DataProto`
-  4. verl: ref log-probs → `compute_grpo_outcome_advantage(uid grouping)` → `update_actor` (DAPO knobs)
-  5. every `save_freq` steps: save + push `step-N` (reuse `training/sft/upload.push_checkpoint`)
+  per step (one dataloader batch of B target words):
+    1. expand each target to G episodes → drive them TURN BY TURN, generating each turn via verl's
+       `async_rollout_manager.generate_sequences` (stripped-context messages in → prompt+response ids).
+    2. emit ONE per-turn sample per move (uid=(target,round)), reward = per-turn local R_t.
+    3. pack → DataProto; reuse verl's `_compute_old_log_prob` / `_compute_ref_log_prob` /
+       `compute_advantage` (GRPO, groups by `uid`) / `_update_actor` / `_save_checkpoint`.
 
-NOTE (VERL-VERSION): the worker-group construction and the exact method names
-(`RayPPOTrainer`, `ActorRolloutRefWorker`, `compute_grpo_outcome_advantage`, `DataProto.from_dict`)
-move across verl releases. The two seams to confirm at the `--max-steps 5` probe are marked
-`# VERL-VERSION`: (a) `_build_workers` (how the rollout/actor/ref worker groups are spun up), and
-(b) `verl_batch_generate` (how to ask the rollout engine for completions given prompt token ids).
-Everything between them — our rollout, reward, packing, uid grouping — is verl-agnostic and unit-tested.
+verl's optimizer core is untouched. The only verl-version-sensitive bits are the generate_sequences
+input/output field names and the DataProto contract — verified against verl 0.8.0.
 """
 
 from __future__ import annotations
 
+import os
 import random
-from pathlib import Path
+import uuid
 from typing import Any
 
+import numpy as np
+
+from training.grpo.reward import RewardWeights, reward_breakdown
 from training.grpo.rollout import make_groups, roll_batch
-from training.grpo.reward import RewardWeights
+from training.grpo.sample_packing import to_dataproto
 
 
-# ---------------------------------------------------------------------------
-# Config assembly (OmegaConf) — pure, no verl needed to read/inspect.
-# ---------------------------------------------------------------------------
-def build_config(config_dir: str, config_name: str, *, init_model_dir: str, train_parquet: str,
-                 run_name: str, wandb_project: str, train_batch_size: int, group_size: int,
-                 clip_ratio_low: float, clip_ratio_high: float, kl_loss_coef: float, lr: float,
-                 total_epochs: int, max_steps: int | None, n_gpus: int,
-                 extra_overrides: list[str]) -> Any:
-    """Load `config/<config_name>.yaml` and apply the run's overrides → an OmegaConf config."""
-    from omegaconf import OmegaConf
-
-    cfg = OmegaConf.load(str(Path(config_dir) / f"{config_name}.yaml"))
-    ov = {
-        "actor_rollout_ref.model.path": init_model_dir,
-        "actor_rollout_ref.ref.model.path": init_model_dir,
-        "actor_rollout_ref.actor.optim.lr": lr,
-        "actor_rollout_ref.actor.clip_ratio_low": clip_ratio_low,
-        "actor_rollout_ref.actor.clip_ratio_high": clip_ratio_high,
-        "actor_rollout_ref.actor.kl_loss_coef": kl_loss_coef,
-        "actor_rollout_ref.rollout.n": group_size,
-        "data.train_files": train_parquet,
-        "data.train_batch_size": train_batch_size,
-        "trainer.total_epochs": total_epochs,
-        "trainer.n_gpus_per_node": n_gpus,
-        "trainer.experiment_name": run_name,
-        "trainer.project_name": wandb_project,
-    }
+def build_overrides(*, init_model_dir: str, train_parquet: str, run_name: str, wandb_project: str,
+                    train_batch_size: int, group_size: int, clip_ratio_low: float,
+                    clip_ratio_high: float, kl_loss_coef: float, lr: float, total_epochs: int,
+                    max_steps: int | None, n_gpus: int, save_freq: int,
+                    default_local_dir: str, extra: list[str]) -> list[str]:
+    """Hydra dotlist overrides applied on top of verl's default `ppo_trainer` config."""
+    ov = [
+        f"actor_rollout_ref.model.path={init_model_dir}",
+        f"actor_rollout_ref.actor.optim.lr={lr}",
+        f"actor_rollout_ref.actor.clip_ratio_low={clip_ratio_low}",
+        f"actor_rollout_ref.actor.clip_ratio_high={clip_ratio_high}",
+        f"actor_rollout_ref.actor.use_kl_loss=true",
+        f"actor_rollout_ref.actor.kl_loss_coef={kl_loss_coef}",
+        f"actor_rollout_ref.actor.loss_agg_mode=token-mean",
+        f"actor_rollout_ref.rollout.name=vllm",
+        f"actor_rollout_ref.rollout.mode=async",
+        f"actor_rollout_ref.rollout.n={group_size}",
+        f"actor_rollout_ref.rollout.temperature=1.0",
+        f"actor_rollout_ref.rollout.gpu_memory_utilization=0.55",
+        f"algorithm.adv_estimator=grpo",
+        f"algorithm.use_kl_in_reward=false",
+        f"data.train_files={train_parquet}",
+        f"data.val_files={train_parquet}",
+        f"data.train_batch_size={train_batch_size}",
+        f"data.max_prompt_length=1024",
+        f"data.max_response_length=1024",
+        f"trainer.n_gpus_per_node={n_gpus}",
+        f"trainer.nnodes=1",
+        f"trainer.total_epochs={total_epochs}",
+        f"trainer.save_freq={save_freq}",
+        f"trainer.test_freq=0",
+        f"trainer.val_before_train=false",
+        f"trainer.project_name={wandb_project}",
+        f"trainer.experiment_name={run_name}",
+        f"trainer.default_local_dir={default_local_dir}",
+        f"trainer.logger=[console,wandb]",
+    ]
     if max_steps is not None:
-        ov["trainer.total_training_steps"] = max_steps
-    cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist([f"{k}={v}" for k, v in ov.items()]))
-    if extra_overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(extra_overrides)))
-    return cfg
+        ov.append(f"trainer.total_training_steps={max_steps}")
+    ov.extend(extra or [])
+    return ov
 
 
-# ---------------------------------------------------------------------------
-# verl seam (a): build the worker groups. # VERL-VERSION
-# ---------------------------------------------------------------------------
-def _build_workers(cfg: Any):
-    """Spin up verl's actor/ref/rollout worker groups for `cfg`.
-
-    Mirror verl's DAPO recipe `main_dapo.py` / `RayPPOTrainer.init_workers()`. Returns whatever the
-    loop needs: (actor_rollout_wg, ref_wg, tokenizer, checkpoint_manager). Kept isolated so a verl
-    bump is a localized edit.
-    """
-    raise NotImplementedError(
-        "VERL-VERSION seam: wire verl's RayPPOTrainer/worker groups here, copying the setup from the "
-        "installed verl's recipe/dapo/main_dapo.py (ResourcePoolManager, Role, ActorRolloutRefWorker). "
-        "Run with --smoke-local to validate the rollout/reward/packing pipeline without this.")
-
-
-# ---------------------------------------------------------------------------
-# verl seam (b): rollout engine → token ids. # VERL-VERSION
-# ---------------------------------------------------------------------------
-def verl_batch_generate(actor_rollout_wg: Any, tokenizer: Any, sampling: dict):
-    """Return a `batch_generate(prompts: list[list[int]]) -> list[list[int]]` bound to verl's engine.
-
-    verl's rollout worker generates from a `DataProto` of prompts and returns responses; we adapt that
-    to the simple token-ids-in/token-ids-out contract `roll_batch` expects. Confirm the worker method
-    (`generate_sequences`) and the response field against the installed verl.
-    """
-    from training.grpo.sample_packing import pad_left
-
-    def batch_generate(prompts: list[list[int]]) -> list[list[int]]:
-        # VERL-VERSION: build a prompt-only DataProto, call actor_rollout_wg.generate_sequences,
-        # slice off the prompt to get each response's new token ids.
-        raise NotImplementedError("VERL-VERSION seam: bind to verl rollout engine generate_sequences.")
-
-    return batch_generate
-
-
-# ---------------------------------------------------------------------------
-# The training loop — our logic; verl calls behind the two seams above.
-# ---------------------------------------------------------------------------
 def run(*, config_dir: str, config_name: str, init_model_dir: str, train_parquet: str,
         reward_weights_json: str, run_name: str, wandb_project: str, hub_model_id: str | None,
         train_batch_size: int, group_size: int, max_turns: int, enable_thinking: bool,
         clip_ratio_low: float, clip_ratio_high: float, kl_loss_coef: float, lr: float,
         filter_top_variance_frac: float, total_epochs: int, max_steps: int | None, n_gpus: int,
         extra_overrides: list[str]) -> None:
+    """Compose verl's config + monkeypatch our trainer + launch verl's run_ppo."""
+    import verl
+    import verl.trainer.main_ppo as mp
+    from hydra import compose, initialize_config_dir
+
+    # stash run-scoped settings for fit() to read (verl constructs the trainer for us)
+    _RUN_STATE.update(
+        weights=RewardWeights.from_overrides(**_load_weights(reward_weights_json)),
+        max_turns=max_turns, enable_thinking=enable_thinking, group_size=group_size,
+        hub_model_id=hub_model_id, filter_top_variance_frac=filter_top_variance_frac,
+    )
+
+    verl_cfg_dir = os.path.join(os.path.dirname(verl.__file__), "trainer", "config")
+    overrides = build_overrides(
+        init_model_dir=init_model_dir, train_parquet=train_parquet, run_name=run_name,
+        wandb_project=wandb_project, train_batch_size=train_batch_size, group_size=group_size,
+        clip_ratio_low=clip_ratio_low, clip_ratio_high=clip_ratio_high, kl_loss_coef=kl_loss_coef,
+        lr=lr, total_epochs=total_epochs, max_steps=max_steps, n_gpus=n_gpus, save_freq=25,
+        default_local_dir=os.path.join(os.path.dirname(train_parquet), "ckpt"), extra=extra_overrides)
+
+    with initialize_config_dir(config_dir=verl_cfg_dir, version_base=None):
+        cfg = compose(config_name="ppo_trainer", overrides=overrides)
+
+    mp.RayPPOTrainer = PerTurnGRPOTrainer        # verl's TaskRunner will build OURS
+    print("[grpo] launching verl run_ppo with PerTurnGRPOTrainer (per-turn, DAPO knobs)")
+    mp.run_ppo(cfg)
+
+
+def _load_weights(path: str) -> dict:
     import json
 
-    from distillation.registry import GAMES
+    if path and os.path.exists(path):
+        return json.load(open(path)).get("weights", {})
+    return {}
 
-    cfg = build_config(config_dir, config_name, init_model_dir=init_model_dir,
-                       train_parquet=train_parquet, run_name=run_name, wandb_project=wandb_project,
-                       train_batch_size=train_batch_size, group_size=group_size,
-                       clip_ratio_low=clip_ratio_low, clip_ratio_high=clip_ratio_high,
-                       kl_loss_coef=kl_loss_coef, lr=lr, total_epochs=total_epochs,
-                       max_steps=max_steps, n_gpus=n_gpus, extra_overrides=extra_overrides)
 
-    with open(reward_weights_json) as f:
-        weights = RewardWeights.from_overrides(**json.load(f).get("weights", {}))
+# Run-scoped state (set in run(), read in fit()); verl owns trainer construction so we can't pass args.
+_RUN_STATE: dict[str, Any] = {}
 
-    actor_rollout_wg, ref_wg, tokenizer, ckpt = _build_workers(cfg)   # VERL-VERSION seam (a)
-    sampling = {"temperature": float(cfg.actor_rollout_ref.rollout.temperature),
-                "top_p": float(cfg.actor_rollout_ref.rollout.top_p),
-                "max_tokens": int(cfg.data.max_response_length)}
-    batch_generate = verl_batch_generate(actor_rollout_wg, tokenizer, sampling)   # seam (b)
 
-    rng = random.Random(int(cfg.get("data", {}).get("seed", 0)) if hasattr(cfg, "get") else 0)
-    spec_w = GAMES["wordle"]()
+# ---------------------------------------------------------------------------
+# The trainer: only fit() is overridden.
+# ---------------------------------------------------------------------------
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_advantage  # noqa: E402
+from verl.trainer.ppo.core_algos import AdvantageEstimator  # noqa: E402
 
-    step = 0
-    while max_steps is None or step < max_steps:
-        # 1) targets → episode specs (G per target)
-        targets = spec_w.sample_targets(train_batch_size, "train", rng)
-        specs = make_groups(targets, group_size, game="wordle")
-        # 2) per-turn rollout via verl's engine
-        samples, outcomes = roll_batch(specs, tokenizer=tokenizer, batch_generate=batch_generate,
-                                       weights=weights, enable_thinking=enable_thinking,
-                                       max_turns=max_turns)
-        # 3) pack → DataProto ; 4) verl advantage(uid)+update ; 5) save/push
-        # VERL-VERSION: to_dataproto(samples) → ref logprobs → compute_grpo_outcome_advantage(index=uid)
-        #   → update_actor(DAPO knobs) → if step % save_freq == 0: save + push_checkpoint(step-N).
-        raise NotImplementedError(
-            "VERL-VERSION: complete the optimize step (pack→advantage→update→save) using the installed "
-            "verl's RayPPOTrainer methods — the rollout/reward/packing above are done and tested.")
+
+class PerTurnGRPOTrainer(RayPPOTrainer):
+    def fit(self):
+        from omegaconf import OmegaConf
+        from tqdm import tqdm
+        from verl.protocol import DataProto
+        from verl.utils.tracking import Tracking
+
+        st = _RUN_STATE
+        weights: RewardWeights = st["weights"]
+        G = st["group_size"]
+        logger = Tracking(project_name=self.config.trainer.project_name,
+                          experiment_name=self.config.trainer.experiment_name,
+                          default_backend=self.config.trainer.logger,
+                          config=OmegaConf.to_container(self.config, resolve=True))
+        self.global_steps = 0
+        self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
+        self.global_steps += 1
+        pbar = tqdm(total=self.total_training_steps, initial=0, desc="per-turn GRPO")
+
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics: dict[str, Any] = {}
+                base = DataProto.from_single_dict(batch_dict)
+                targets = self._targets_from_batch(base)
+
+                # ---- per-turn rollout via verl's rollout engine ----
+                specs = make_groups(targets, G, game="wordle")
+                samples, outcomes = roll_batch(
+                    specs, tokenizer=self.tokenizer, generate=self._make_generate(),
+                    weights=weights, enable_thinking=st["enable_thinking"], max_turns=st["max_turns"])
+                if not samples:
+                    continue
+
+                batch = to_dataproto(samples, pad_id=self.tokenizer.pad_token_id or 0,
+                                     max_prompt_len=self.config.data.max_prompt_length,
+                                     max_response_len=self.config.data.max_response_length)
+                # GRPO groups by `index`; map our uid=(target,round) onto it.
+                batch.non_tensor_batch["uid"] = batch.non_tensor_batch["uid"]
+                batch.non_tensor_batch["index"] = batch.non_tensor_batch["uid"]
+                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                # ---- reuse verl: old/ref logprob → advantage(grpo, by uid) → update ----
+                old = self._compute_old_log_prob(batch)
+                batch = batch.union(old[0] if isinstance(old, tuple) else old)
+                ref = self._compute_ref_log_prob(batch)
+                batch = batch.union(ref)
+                batch = compute_advantage(
+                    batch, adv_estimator=AdvantageEstimator.GRPO,
+                    gamma=self.config.algorithm.gamma, lam=self.config.algorithm.lam,
+                    num_repeat=G,
+                    norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                    config=self.config.algorithm)
+                actor_output = self._update_actor(batch)
+
+                # ---- metrics ----
+                metrics.update(self._reward_metrics(outcomes, samples, weights))
+                try:
+                    from verl.utils.metric import reduce_metrics
+                    metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                except Exception:
+                    pass
+                logger.log(data=metrics, step=self.global_steps)
+                pbar.set_postfix({k: round(v, 3) for k, v in metrics.items()
+                                  if isinstance(v, (int, float))} or {})
+
+                # ---- save + push ----
+                if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
+                    self._save_checkpoint()
+                    self._push_step()
+                self.checkpoint_manager.update_weights(self.global_steps)
+
+                pbar.update(1)
+                self.global_steps += 1
+                if self.global_steps > self.total_training_steps:
+                    self._save_checkpoint(); self._push_step()
+                    return
+
+    # ---- helpers ----
+    def _targets_from_batch(self, base) -> list[str]:
+        nb = base.non_tensor_batch
+        if "reward_model" in nb:
+            return [rm["ground_truth"] for rm in nb["reward_model"]]
+        if "extra_info" in nb:
+            return [ei["target"] for ei in nb["extra_info"]]
+        raise RuntimeError("no target in batch (need reward_model.ground_truth or extra_info.target)")
+
+    def _make_generate(self):
+        """messages -> [(prompt_ids, response_ids)] via verl's async_rollout_manager.generate_sequences."""
+        from verl.protocol import DataProto
+
+        def generate(messages_list: list[list[dict]]):
+            n = len(messages_list)
+            proto = DataProto.from_dict(
+                non_tensors={"raw_prompt": np.array(messages_list + [None], dtype=object)[:n],
+                             "agent_name": np.array(["single_turn_agent"] * n, dtype=object)},
+                meta_info={"global_steps": self.global_steps})
+            out = self.async_rollout_manager.generate_sequences(proto)
+            prompts = out.batch["prompts"]            # [n, prompt_len] left-padded
+            responses = out.batch["responses"]        # [n, resp_len] right-padded
+            resp_mask = out.batch.get("response_mask")
+            res = []
+            for i in range(n):
+                p = prompts[i].tolist()
+                p = [t for t in p if t != (self.tokenizer.pad_token_id or 0)] or p  # strip left pad
+                rmask = resp_mask[i].tolist() if resp_mask is not None else None
+                r = responses[i].tolist()
+                if rmask is not None:
+                    r = [t for t, m in zip(r, rmask) if m]
+                res.append((p, r))
+            return res
+
+        return generate
+
+    def _reward_metrics(self, outcomes, samples, weights) -> dict[str, float]:
+        n = len(outcomes)
+        solved = sum(1 for o in outcomes if o["status"] == "won")
+        agg = {"novel": 0.0, "format": 0.0, "invalid": 0.0, "win": 0.0}
+        for o in outcomes:
+            for k, v in reward_breakdown(o, weights).items():
+                agg[k] += v
+        import statistics
+        rewards = [s.reward for s in samples]
+        return {
+            "rollout/win_rate": solved / max(1, n),
+            "rollout/avg_turns": sum(len(o["turns"]) for o in outcomes) / max(1, n),
+            "rollout/n_samples": float(len(samples)),
+            "reward/mean": sum(rewards) / max(1, len(rewards)),
+            "reward/std": statistics.pstdev(rewards) if len(rewards) > 1 else 0.0,
+            "reward/novel": agg["novel"] / max(1, n),
+            "reward/format": agg["format"] / max(1, n),
+            "reward/invalid": agg["invalid"] / max(1, n),
+            "reward/win": agg["win"] / max(1, n),
+        }
+
+    def _push_step(self):
+        hub = _RUN_STATE.get("hub_model_id")
+        if not hub:
+            return
+        try:
+            from glob import glob
+            from training.grpo.push import push_step
+            ckpts = sorted(glob(os.path.join(self.config.trainer.default_local_dir, "global_step_*")))
+            if ckpts:
+                push_step(ckpts[-1], hub, self.global_steps)
+        except Exception as e:  # never let a push failure kill training
+            print(f"[grpo] push step-{self.global_steps} failed (non-fatal): {e}")

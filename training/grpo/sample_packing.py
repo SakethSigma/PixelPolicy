@@ -90,12 +90,22 @@ def to_dataproto(samples: list[TurnSample], *, pad_id: int, max_prompt_len: int,
     attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
     position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0) * attention_mask
 
+    # token_level_scores: [B, max_resp], the per-sample reward placed at each row's LAST real response
+    # token (verl's GRPO sums these per sequence, normalizes within the uid group → advantage).
+    token_level_scores = torch.zeros_like(response_ids, dtype=torch.float32)
+    lengths = response_mask.sum(dim=1)                       # real response length per row
+    rewards = torch.tensor(rows["reward"], dtype=torch.float32)
+    for i, ln in enumerate(lengths.tolist()):
+        if ln > 0:
+            token_level_scores[i, int(ln) - 1] = rewards[i]
+
     batch = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "position_ids": position_ids,
         "responses": response_ids,
         "response_mask": response_mask,
+        "token_level_scores": token_level_scores,
     }
     non_tensor = {
         "uid": rows["uid"],                 # GRPO group key

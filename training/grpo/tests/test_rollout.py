@@ -28,14 +28,16 @@ class FakeTokenizer:
 
 
 def _gen_for(replies):
-    """A batched generate for a lockstep rollout: all live episodes are at the same turn, so on the
-    k-th call we serve `replies[k]` to every prompt. `replies` is the shared per-turn script."""
+    """A message-based generate for a lockstep rollout: all live episodes are at the same turn, so on
+    the k-th call we serve `replies[k]` to every prompt. Returns (templated prompt_ids, response_ids)
+    per message list — the same contract verl's generate_sequences provides."""
     clock = {"k": 0}
 
-    def gen(prompts):
+    def gen(messages_list):
         reply = replies[clock["k"]]
         clock["k"] += 1
-        return [tok.encode(reply) for _ in prompts]
+        return [(tok.apply_chat_template(m, add_generation_prompt=True, tokenize=True), tok.encode(reply))
+                for m in messages_list]
 
     return gen
 
@@ -52,7 +54,7 @@ def test_one_sample_per_turn_with_stripped_prompt():
         "<think>got it</think>\n<guess>vivid</guess>",  # round 2: win
     ]
     samples, outcomes = roll_batch(
-        specs, tokenizer=tok, batch_generate=_gen_for(replies), weights=weights, max_turns=6)
+        specs, tokenizer=tok, generate=_gen_for(replies), weights=weights, max_turns=6)
 
     # 8 episodes × 2 turns = 16 samples
     assert len(samples) == 16
@@ -91,7 +93,7 @@ def test_per_turn_local_reward_and_round_decay():
         "<think>a</think>\n<guess>vapor</guess>",        # round 1: V green at pos0 (new) -> high
         "<think>b</think>\n<guess>vivid</guess>",        # round 2: win, greens incl. re-green pos0
     ]
-    samples, _ = roll_batch(specs, tokenizer=tok, batch_generate=_gen_for(replies),
+    samples, _ = roll_batch(specs, tokenizer=tok, generate=_gen_for(replies),
                             weights=weights, max_turns=6)
     r1, r2 = samples[0].reward, samples[1].reward
     # round 1 earns format + a new green; both > 0, and no terminal was added (win_bonus 0)
@@ -106,7 +108,7 @@ def test_variable_turn_counts_no_crash():
     # immediate win in 1 turn
     samples, outcomes = roll_batch(
         specs, tokenizer=tok,
-        batch_generate=_gen_for(["<think>z</think><guess>vivid</guess>"]),
+        generate=_gen_for(["<think>z</think><guess>vivid</guess>"]),
         weights=RewardWeights(), max_turns=6)
     assert all(o["rounds_used"] == 1 for o in outcomes)
     assert len(samples) == 2 and all(s.round == 1 for s in samples)

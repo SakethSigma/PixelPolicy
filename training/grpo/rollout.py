@@ -37,8 +37,9 @@ from training.grpo.reward import (
     per_turn_rewards,
 )
 
-# prompts -> responses, both as token-id lists. Batched (one call for many in-flight turns).
-BatchGenerate = Callable[[list[list[int]]], list[list[int]]]
+# messages -> (templated prompt ids, response ids). Batched (one call for many in-flight turns).
+# The generator applies the chat template (stripping prior <think>, matching inference).
+Generate = Callable[[list[list[dict]]], list[tuple[list[int], list[int]]]]
 
 
 @dataclass
@@ -105,10 +106,9 @@ class _EpisodeRun:
     def live(self) -> bool:
         return self.state.status == "in_progress" and len(self.history) < self.max_rounds
 
-    def prompt_ids(self, tokenizer) -> list[int]:
-        messages = self.agent.build_messages(self.state, self.history)   # STRIPPED context (= inference)
-        return tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True, enable_thinking=self.enable_thinking)
+    def messages(self) -> list[dict]:
+        # STRIPPED context (= inference): WordleAgent.build_messages replays only <guess>, no think.
+        return self.agent.build_messages(self.state, self.history)
 
     def step(self, tokenizer, prompt_ids: list[int], response_ids: list[int]) -> None:
         text = tokenizer.decode(response_ids)
@@ -155,13 +155,18 @@ def roll_batch(
     specs: list[tuple[str, str]],          # [(game, target)] — one episode each (G copies of a target = a group)
     *,
     tokenizer: Any,
-    batch_generate: BatchGenerate,
+    generate: Generate,
     weights: RewardWeights,
     enable_thinking: bool = True,
     require_think: bool = True,
     max_turns: int = 6,
 ) -> tuple[list[TurnSample], list[EpisodeOutcome]]:
     """Roll all episodes, returning the flat per-turn samples + per-episode outcomes.
+
+    `generate(list_of_message_lists) -> list[(prompt_ids, response_ids)]` is the injected generation:
+    it applies the chat template (stripping prior `<think>`, = inference) and generates one completion
+    per message list, returning the templated prompt ids + the response ids. In training this wraps
+    verl's `async_rollout_manager.generate_sequences`; in tests it's a fake tokenizer + scripted reply.
 
     Generation is batched once per turn across all still-live episodes. The number of samples an
     episode contributes equals the number of turns it actually played (2 here, 5 there) — verl
@@ -176,12 +181,12 @@ def roll_batch(
         live = [r for r in runs if r.live]
         if not live:
             break
-        prompts = [r.prompt_ids(tokenizer) for r in live]
-        responses = batch_generate(prompts)
-        if len(responses) != len(live):
-            raise RuntimeError(f"batch_generate returned {len(responses)} responses for {len(live)} prompts")
-        for r, p, resp in zip(live, prompts, responses):
-            r.step(tokenizer, p, resp)
+        msgs = [r.messages() for r in live]
+        gen = generate(msgs)
+        if len(gen) != len(live):
+            raise RuntimeError(f"generate returned {len(gen)} outputs for {len(live)} prompts")
+        for r, (prompt_ids, response_ids) in zip(live, gen):
+            r.step(tokenizer, prompt_ids, response_ids)
 
     samples: list[TurnSample] = []
     outcomes: list[EpisodeOutcome] = []

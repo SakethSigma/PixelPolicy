@@ -126,13 +126,16 @@ def smoke_local(args: argparse.Namespace, r: dict) -> None:
     specs = make_groups(targets, args.group_size, game="wordle")
     tok = _FakeTokenizer()
 
-    # a scripted, lockstep generator: round 1 a broad open, then guess the (known, smoke-only) target
-    def batch_generate(prompts):
-        # Round-robin a couple of canned replies; correctness of REWARDS isn't the point here,
-        # only that the pipeline runs and shapes/uids are sane.
-        return [tok.encode("<think>x</think>\n<guess>crane</guess>") for _ in prompts]
+    # a scripted, message-based generator: returns (templated prompt_ids, response_ids) per prompt —
+    # the same contract verl's generate_sequences provides. Reward correctness isn't the point here,
+    # only that the pipeline runs and shapes/uids are sane.
+    reply = tok.encode("<think>x</think>\n<guess>crane</guess>")
 
-    samples, outcomes = roll_batch(specs, tokenizer=tok, batch_generate=batch_generate,
+    def generate(messages_list):
+        return [(tok.apply_chat_template(m, add_generation_prompt=True, tokenize=True), reply)
+                for m in messages_list]
+
+    samples, outcomes = roll_batch(specs, tokenizer=tok, generate=generate,
                                    weights=weights, enable_thinking=args.enable_thinking,
                                    max_turns=args.max_turns)
     rows = pack_rows(samples, pad_id=0, max_prompt_len=1024, max_response_len=1024)
