@@ -1,0 +1,15 @@
+# GRPO config — Arm C (init = word-games-sft-full-v2 → GRPO on ALL 13 games jointly).
+#
+# The dilution check: does training the full game family with RL help or hurt wordle vs. the
+# wordle-only Arm B? The per-turn rollout (rollout.roll_batch) dispatches on the game: wordle gets the
+# dense per-turn local reward, every other game gets sparse solved/not-solved. Data is the per-game
+# parquet built by `data.build_dataset("all", ...)`; max turns per game come from each GameSpec.
+
+defaults:
+  - grpo_wordle        # inherit the wordle base (per-turn + DAPO knobs)
+  - _self_
+
+data:
+  # "all" draws --n targets PER game, so the parquet is larger; a bigger batch keeps each game
+  # represented within a step. Raise ppo_mini_batch grad-accum if memory tightens.
+  train_batch_size: 104          # ~8 per game across 13 games

@@ -1,0 +1,67 @@
+# GRPO (per-turn, DAPO-stabilized) — Arm A base; Arms B/C overlay this.
+#
+# Our custom trainer (training/grpo/trainer.py) drives a PER-TURN rollout (rollout.roll_batch) and
+# packs one sample per move; verl provides the UNPATCHED optimizer core (advantage by uid, FSDP actor
+# update, ref/KL, checkpoint). So a few stock-verl rollout keys (multi_turn / agent loop) are NOT used
+# here — stripping is done by WordleAgent.build_messages, and grouping is uid=(target, round).
+#
+# Based on verl's first-class DAPO recipe (recipe/dapo). VERL-VERSION: confirm key names at the probe.
+
+defaults:
+  - ppo_trainer        # verl's full default tree
+  - _self_
+
+algorithm:
+  adv_estimator: grpo            # group-relative advantage; group key = uid=(target, round)
+  use_kl_in_reward: false        # KL is a loss term (standard GRPO/DAPO), not folded into reward
+  filter_groups:
+    enable: true                 # DAPO dynamic sampling: drop degenerate std=0 groups
+    metric: reward
+
+data:
+  train_files: PLACEHOLDER       # set by trainer (the pinned-target parquet; targets are re-drawn/step)
+  train_batch_size: 64           # B target words/step (× rollout.n episodes)
+  max_prompt_length: 1024        # one stripped turn's context
+  max_response_length: 1024      # one turn's <think>+<guess> (NOT the whole game — per-turn samples)
+  seed: 0
+
+actor_rollout_ref:
+  model:
+    path: PLACEHOLDER            # set by trainer (snapshot_download of the SFT init)
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+  actor:
+    strategy: fsdp
+    optim: { lr: 1.0e-6 }        # RL LR ≪ SFT 2e-5
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 4
+    loss_agg_mode: token-mean    # DAPO token-level loss (removes long-<think> length bias)
+    clip_ratio_low: 0.2          # DAPO clip-higher: decoupled ε ...
+    clip_ratio_high: 0.28        # ... larger upper bound → preserves exploration, guards entropy collapse
+    use_kl_loss: true            # KL flag (light anchor to the SFT init); set kl_loss_coef=0 to remove
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.0
+    fsdp_config: { param_offload: false, optimizer_offload: false }
+  ref:
+    fsdp_config: { param_offload: false }   # frozen SFT init = the KL anchor
+  rollout:
+    name: sglang                 # rollout engine (fallback: vllm). Our driver batches generation per turn.
+    mode: async
+    temperature: 1.0             # train-time exploration (eval is 0.6, out-of-band)
+    top_p: 0.95
+    n: 8                         # G = episodes per target (GRPO group size before per-round split)
+    gpu_memory_utilization: 0.55
+    max_num_seqs: 256
+    tensor_model_parallel_size: 1
+    vllm_importance_sampling_correction: true   # TIS: vLLM↔FSDP logprob mismatch guard
+
+trainer:
+  total_epochs: 2
+  save_freq: 25
+  test_freq: 0                   # eval out-of-band via inference/run_checkpoints.py
+  logger: [console, wandb]
+  project_name: pixelpolicy-grpo
+  n_gpus_per_node: 1
+  nnodes: 1
+  default_local_dir: /workspace/grpo/ckpt

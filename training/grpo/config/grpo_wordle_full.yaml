@@ -1,0 +1,16 @@
+# GRPO config — Arm B (init = word-games-sft-full-v2 → GRPO on Wordle).
+#
+# Identical to Arm A except the init checkpoint (injected by train.py from --arm b). Kept as its own
+# named config so the run is self-documenting and so Arm-B-specific tweaks (e.g. a slightly higher KL
+# to keep the broader policy from collapsing onto wordle) have a home. The init path itself comes from
+# the CLI override, so structurally this just inherits the wordle base.
+
+defaults:
+  - grpo_wordle        # inherit Arm A's full config
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    # The full-v2 init is a broader policy; a touch more KL anchoring guards against fast collapse
+    # onto wordle. Ablate by overriding --kl-loss-coef.
+    kl_loss_coef: 0.002
