@@ -10,34 +10,55 @@ so you merge the dirs locally.
 
 ---
 
-## 1. One-time setup on the eval pod (A100, template: Runpod Pytorch 2.4.0)
+## 1. One-time setup on the eval pod
+
+Fresh pods are bare — install the basics first (**git is usually missing**):
 
 ```bash
-apt-get update && apt-get install -y tmux ; tmux new -s eval     # survive disconnects
+apt-get update && apt-get install -y git tmux curl procps      # procps = `watch`; tmux = survive disconnects
 curl -LsSf https://astral.sh/uv/install.sh | sh ; source $HOME/.local/bin/env
 git clone https://github.com/SakethSigma/PixelPolicy.git && cd PixelPolicy
-git reset --hard origin/main                                     # exact pushed code (fetch is implicit on fresh clone)
+git log --oneline -1                                           # confirm latest pushed code (>= 7602785, the crash-safe fix)
+export HF_TOKEN=hf_xxxxxxxx                                    # needed to DOWNLOAD the (private) checkpoints
+```
 
-uv sync --package inference                                      # eval harness deps (agents + distillation + vllm)
-# vLLM has a compiled CUDA extension, so vLLM AND torch must be the SAME CUDA (12.8). Two
-# constraints pull in opposite directions, so you must hit a WINDOW — not just "pin low":
-#   1. Qwen3.5 (Qwen3_5ForConditionalGeneration) needs vLLM >= 0.17.0. Older vllm (e.g. 0.10.2)
-#      errors: "Model architectures ['Qwen3_5ForConditionalGeneration'] are not supported".
+Then get vLLM in place. **Prefer 1A** (a template that already has a working vLLM) — it sidesteps the
+whole CUDA-version dance.
+
+### 1A. RECOMMENDED — start from a vLLM template, keep its vLLM, add ONLY our deps
+
+Qwen3.5 needs vLLM **>= 0.17**, and the latest vLLM ships CUDA-13 wheels that die on a 12.8 driver
+(`libcudart.so.13`). Easiest fix: pick a RunPod template that ALREADY ships a working vLLM, then
+install OUR pure-Python deps **without touching its vllm/torch**. The repo's packages are
+`package = false` (imported via the workspace PYTHONPATH, not built), so you only need their
+third-party deps (pydantic, httpx, openai, huggingface-hub, datasets, …).
+
+```bash
+which vllm; python3 -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__)"
+# if the template's vLLM lives in a venv, ACTIVATE it first:  source /path/to/that/venv/bin/activate
+
+uv sync --package inference --active --inexact \
+  --no-install-package vllm --no-install-package torch         # install OUR deps INTO the template env; keep its vllm/torch
+uv run --no-sync --active --package inference vllm --version   # template vllm, unchanged (no libcudart error)
+```
+**With path 1A, add `--active` to EVERY `uv run` below** (so it uses the template env, not a fresh
+`.venv`). Fallback if `--active` doesn't catch the env (conda/system Python, not a venv):
+`uv pip install --python "$(which python3)" "pydantic>=2" python-dotenv "httpx>=0.27" "openai>=1" "huggingface-hub>=0.20" "datasets>=2" "anthropic>=0.40"`.
+
+### 1B. FALLBACK — plain pod (no usable vLLM), install a cu128 vLLM yourself
+
+```bash
+uv sync --package inference                                     # eval harness deps (agents + distillation + vllm)
+# vLLM has a compiled CUDA extension, so vLLM AND torch must be the SAME CUDA (12.8). Hit a WINDOW:
+#   1. Qwen3.5 (Qwen3_5ForConditionalGeneration) needs vLLM >= 0.17.0 (older errors "not supported").
 #   2. vLLM >= ~0.21 defaults to a CUDA-13 wheel → "libcudart.so.13" on a 12.8 driver. And
-#      --torch-backend=cu128 only fixes TORCH's index, NOT vllm's own compiled _C — so even with
-#      cu128 torch, a cu13 vllm wheel still dies (vllm#43435).
-# => Target vLLM 0.17–0.20: new enough for Qwen3.5, old enough to still ship a cu128 wheel.
-# 0.19.0 is CONFIRMED working on the A100 pod (cu128, Qwen3.5 loads). Use it:
+#      --torch-backend=cu128 only fixes TORCH's index, NOT vllm's compiled _C (vllm#43435).
+# => Target vLLM 0.17–0.20. 0.19.0 is CONFIRMED working (cu128, Qwen3.5 loads):
 uv pip install --reinstall "vllm==0.19.0" --torch-backend=cu128
-#   if it ever fails the `vllm --version` test below, walk DOWN: 0.19.0 → 0.18.0 → 0.17.0
-#   (0.20.0+ may drag in cu13 → "libcudart.so.13")
-# If a version still drags in cu13, install its explicit cu128 RELEASE wheel directly (skips the
-# PyPI default; some URLs 404 → try the next minor, vllm#37847):
+#   if it fails the `vllm --version` test below, walk DOWN: 0.19.0 → 0.18.0 → 0.17.0 (0.20+ may pull cu13)
+# Still cu13? install the explicit cu128 RELEASE wheel (some URLs 404 → next minor, vllm#37847):
 #   uv pip install https://github.com/vllm-project/vllm/releases/download/v0.18.0/vllm-0.18.0+cu128-cp38-abi3-manylinux1_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cu128
-# CLEANER if you control the image: use a CUDA-13 RunPod template (driver >= 580) instead of the
-# "PyTorch 2.4.0" (CUDA 12.1) one, then plain `uv pip install vllm` (latest, cu13) just works.
 
-export HF_TOKEN=hf_xxxxxxxx                                      # needed to DOWNLOAD the (private) checkpoints
 # REAL test — loads the compiled _C extension (NOT just `import vllm`); must print a version, no libcudart:
 uv run --no-sync --package inference vllm --version
 ```
@@ -95,7 +116,7 @@ tmux attach -t eval        # if "no session": it died → just re-run the §2 co
 tmux ls                    # list sessions
 
 # PROGRESS — episodes completed per checkpoint (each *.jsonl climbs to 300; 13 games each).
-# (plain bash loop — `watch` needs `apt-get install -y procps` which the pod lacks)
+# (plain bash loop; `watch -n10 '...'` also works now that §1 installs procps)
 while true; do clear; date; \
   wc -l /workspace/eval_results_v2/raw/*/*.jsonl 2>/dev/null | grep -v total; \
   echo "--- finished checkpoints (pushed to HF) ---"; \
@@ -115,8 +136,9 @@ find /workspace/eval_results_v2/raw -name '*.jsonl' | xargs wc -l | tail -1   # 
 
 ```bash
 cd /mnt/d/Projects/PixelPolicy
-huggingface-cli download saketh-chervu/word-games-eval --repo-type model --local-dir ./eval_results_v2
-# (run it again anytime to pull newer checkpoints as they finish — it's incremental)
+hf download saketh-chervu/word-games-eval --repo-type model --local-dir ./eval_results_v2   # `huggingface-cli` is dead — use `hf`
+# (run it again anytime to pull newer checkpoints as they finish — it's incremental.
+#  for a non-default results branch, e.g. full-v2:  --revision full-v2)
 
 uv run --no-project inference/analysis/viz_eval.py --results ./eval_results_v2 --out eval_plots_v2
 # new metric later? edit inference/metrics.py, then recompute from raw — NO re-inference:
