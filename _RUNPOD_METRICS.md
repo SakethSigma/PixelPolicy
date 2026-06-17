@@ -24,6 +24,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh ; source $HOME/.local/bin/env
 git clone https://github.com/SakethSigma/PixelPolicy.git && cd PixelPolicy
 git log --oneline -1                          # MUST be >= bf5de72 (the vllm/instrumentator pins)
 
+export UV_CONCURRENT_DOWNLOADS=5              # REQUIRED: pod nets choke on uv's ~50 parallel downloads → stall at ~16KiB each
 uv sync --package inference                    # installs the locked set: vllm 0.19.0 + instrumentator 7.1.0 + cu12 torch
 export HF_TOKEN=hf_xxxxxxxx                    # private checkpoints
 
