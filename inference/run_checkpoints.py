@@ -23,19 +23,29 @@ DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-0.8B"
 
 
 def _variant(repo: str) -> str:
-    """saketh-chervu/word-games-sft-wordle → 'wordle' (else the repo's last path component)."""
+    """saketh-chervu/word-games-sft-wordle → 'wordle'; word-games-grpo-armb → 'grpo-armb'."""
     name = repo.rstrip("/").split("/")[-1]
-    return name.replace("word-games-sft-", "") or name
+    for p in ("word-games-sft-", "word-games-"):
+        if name.startswith(p):
+            return name[len(p):] or name
+    return name
 
 
 def _checkpoints(args) -> list[tuple[str, str, str | None]]:
-    """[(label, model, revision)] — optional base first, then one per epoch."""
+    """[(label, model, revision)] — base first (optional), then epochs, then arbitrary revisions.
+
+    `--epochs N,...` → revision `epoch-N`, label `<variant>-eN` (whole-epoch SFT checkpoints).
+    `--revisions BR,...` → revision `BR` as-is, label `<variant>-BR` (any branch/tag, e.g. GRPO
+    `v5-step80`). Same serve/eval/log/push path either way.
+    """
     variant = _variant(args.repo)
     ckpts: list[tuple[str, str, str | None]] = []
     if args.base:
         ckpts.append(("base", args.base_model, None))
     for e in [int(x) for x in args.epochs.split(",") if x.strip()]:
         ckpts.append((f"{variant}-e{e}", args.repo, f"epoch-{e}"))
+    for rev in [r.strip() for r in (args.revisions or "").split(",") if r.strip()]:
+        ckpts.append((f"{variant}-{rev}", args.repo, rev))
     return ckpts
 
 
@@ -109,7 +119,10 @@ def _teardown(proc: subprocess.Popen) -> None:
 def _main() -> None:
     ap = argparse.ArgumentParser(description="Evaluate a variant's epoch checkpoints sequentially.")
     ap.add_argument("--repo", required=True, help="Hub model repo, e.g. you/word-games-sft-wordle.")
-    ap.add_argument("--epochs", default="1,2,3,4", help="comma list of epoch numbers.")
+    ap.add_argument("--epochs", default="", help="comma list of epoch numbers → revision epoch-N "
+                    "(e.g. 1,2,3,4). Empty = none; use --revisions for non-epoch checkpoints.")
+    ap.add_argument("--revisions", default="", help="comma list of arbitrary branch/tag names to "
+                    "evaluate as-is (e.g. v5-step80,v4-step100); label = <variant>-<revision>.")
     ap.add_argument("--base", action="store_true", help="also evaluate the untrained base model.")
     ap.add_argument("--base-model", default=DEFAULT_BASE_MODEL)
     ap.add_argument("--games", default="all")
