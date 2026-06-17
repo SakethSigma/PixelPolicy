@@ -147,6 +147,9 @@ def _main() -> None:
                     help="print the first N raw episodes per game per checkpoint (format check).")
     ap.add_argument("--no-store-raw", action="store_true",
                     help="do NOT persist raw per-episode predictions (default: store to out/raw/<label>/).")
+    ap.add_argument("--keep-think", action="store_true",
+                    help="WORDLE only: replay prior turns' full <think>+<guess> in history (GRPO "
+                         "train/serve parity) instead of the default bare <guess>.")
     ap.add_argument("--push-results-repo", default=None,
                     help="HF repo to auto-upload the whole eval dir (metrics + raw/) to after each "
                          "checkpoint — hands-off, fetch on local. e.g. saketh-chervu/word-games-sft-wordle")
@@ -178,7 +181,7 @@ def _main() -> None:
             run_and_save(label=label, model=model, revision=revision, base_url=base_url,
                          games=games, n=args.n, seed=args.seed, concurrency=args.concurrency,
                          max_tokens=args.max_tokens, out=args.out, show=args.show,
-                         store_raw=not args.no_store_raw)
+                         store_raw=not args.no_store_raw, keep_think=args.keep_think)
             done.append(label)
             if args.push_results_repo:                     # auto-exfil after each checkpoint
                 _push_results(args.out, args.push_results_repo, args.push_results_revision)

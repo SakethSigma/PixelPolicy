@@ -84,7 +84,7 @@ def _episode_record(traj, *, game: str, game_no: int, good_status: str) -> dict:
 
 
 def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, show: int = 0,
-                  raw_dir: str | None = None) -> dict:
+                  raw_dir: str | None = None, keep_think: bool = False) -> dict:
     """Play N seeded held-out (`val`) instances of one game and return its metrics.
 
     If `show > 0`, the first `show` episodes are played sequentially and printed *immediately*.
@@ -100,6 +100,8 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
     spec = GAMES[name]()
     targets = spec.sample_targets(n, "val", random.Random(seed))
     agent = spec.make_agent()
+    agent.replay_think = keep_think   # wordle: replay prior <think>+<guess> (GRPO train/serve parity);
+                                      # other agents ignore this attr (no multi-turn think replay).
 
     jsonl = os.path.join(raw_dir, f"{name}.jsonl") if raw_dir else None
     done = 0
@@ -173,11 +175,11 @@ def evaluate_game(name: str, *, n: int, seed: int, generate, concurrency: int, s
 
 
 def evaluate_all(games: list[str], *, n: int, seed: int, generate, concurrency: int,
-                 show: int = 0, raw_dir: str | None = None) -> dict:
+                 show: int = 0, raw_dir: str | None = None, keep_think: bool = False) -> dict:
     per_game: dict[str, dict] = {}
     for name in games:
         m = evaluate_game(name, n=n, seed=seed, generate=generate, concurrency=concurrency,
-                          show=show, raw_dir=raw_dir)
+                          show=show, raw_dir=raw_dir, keep_think=keep_think)
         per_game[name] = m
         print(f"  {name:<12} acc={m['accuracy']:.1%}  ({m['solved']}/{m['n']})  "
               f"[{m['ci_lo']:.1%}, {m['ci_hi']:.1%}]", file=sys.stderr)
@@ -186,7 +188,7 @@ def evaluate_all(games: list[str], *, n: int, seed: int, generate, concurrency: 
 
 def run_and_save(*, label: str, model: str, revision: str | None, base_url: str,
                  games: list[str], n: int, seed: int, concurrency: int, max_tokens: int,
-                 out: str, show: int = 0, store_raw: bool = True) -> dict:
+                 out: str, show: int = 0, store_raw: bool = True, keep_think: bool = False) -> dict:
     """Build the backend, evaluate all games, write `out/<label>.json`, return the result.
 
     By default the raw per-episode predictions are persisted to `out/raw/<label>/<game>.jsonl`
@@ -197,10 +199,10 @@ def run_and_save(*, label: str, model: str, revision: str | None, base_url: str,
           f"games={len(games)} @ {base_url}", file=sys.stderr)
     raw_dir = os.path.join(out, "raw", label) if store_raw else None
     result = evaluate_all(games, n=n, seed=seed, generate=backend.generate,
-                          concurrency=concurrency, show=show, raw_dir=raw_dir)
+                          concurrency=concurrency, show=show, raw_dir=raw_dir, keep_think=keep_think)
     result.update({"label": label, "model": model, "revision": revision, "n": n, "seed": seed,
                    "sampling": {**EVAL_SAMPLING, "max_tokens": max_tokens},
-                   "raw_dir": raw_dir})
+                   "keep_think": keep_think, "raw_dir": raw_dir})
     Path(out).mkdir(parents=True, exist_ok=True)
     path = os.path.join(out, f"{label}.json")
     with open(path, "w") as f:
@@ -227,6 +229,9 @@ def _main() -> None:
                     help="print the first N raw episodes per game (eyeball <think>/<guess> format).")
     ap.add_argument("--no-store-raw", action="store_true",
                     help="do NOT persist raw per-episode predictions (default: store to out/raw/<label>/).")
+    ap.add_argument("--keep-think", action="store_true",
+                    help="WORDLE only: replay prior turns' full <think>+<guess> in history (matches GRPO "
+                         "training, which kept think blocks) instead of the default bare <guess>.")
     ap.add_argument("--out", default="eval_results")
     args = ap.parse_args()
 
@@ -238,7 +243,7 @@ def _main() -> None:
     run_and_save(label=args.label, model=args.model or cfg.model, revision=args.revision,
                  base_url=args.base_url or cfg.base_url, games=args.games, n=args.n, seed=args.seed,
                  concurrency=args.concurrency, max_tokens=args.max_tokens, out=args.out, show=args.show,
-                 store_raw=not args.no_store_raw)
+                 store_raw=not args.no_store_raw, keep_think=args.keep_think)
 
 
 if __name__ == "__main__":

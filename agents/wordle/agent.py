@@ -63,12 +63,16 @@ class WordleAgent:
             {"role": "user", "content": "Make your first guess."},
         ]
         for turn in history:
-            # Replay only the normalized guess, never the prior chain-of-thought. Qwen's
-            # multi-turn guidance is to drop old reasoning; it also keeps context tiny and
-            # bounded even when a turn's reasoning ran long without terminating (Qwen3.5-0.8B
-            # is prone to thinking loops). `turn.action` is already parse_action(response).
-            guess = f"<guess>{turn.action}</guess>" if turn.action else ""
-            messages.append({"role": "assistant", "content": guess})
+            # Default: replay only the normalized guess, dropping prior chain-of-thought (Qwen
+            # multi-turn guidance; keeps context bounded vs Qwen3.5-0.8B thinking loops).
+            # `replay_think=True` instead replays the model's FULL prior reply (<think>…</think>
+            # <guess>…</guess>) — GRPO training kept think blocks in the rollout history, so this
+            # restores train/serve parity at eval time. `turn.action` is parse_action(response).
+            if getattr(self, "replay_think", False) and turn.response:
+                content = turn.response
+            else:
+                content = f"<guess>{turn.action}</guess>" if turn.action else ""
+            messages.append({"role": "assistant", "content": content})
             messages.append({"role": "user", "content": self._feedback(turn.state)})
         return messages
 
